@@ -1,3 +1,218 @@
+/// How much of a part file is resident while it is being uploaded.
+///
+/// Matched to `flush_chunk_bytes`, which is the size the engine already builds
+/// and writes parts in, and comfortably above the 5 MiB floor `object_store`
+/// documents for every part of a multipart upload but the last.
+const UPLOAD_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Uploads running at once, so a memory peak can be read against how many
+/// bounded buffers were live rather than against one.
+static UPLOADS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+struct UploadInFlight;
+
+impl UploadInFlight {
+    fn enter() -> (Self, u32) {
+        let count = UPLOADS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        (Self, count)
+    }
+}
+
+impl Drop for UploadInFlight {
+    fn drop(&mut self) {
+        UPLOADS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl ObjectStorage {
+    /// One immutable object, uploaded without ever holding it whole.
+    ///
+    /// At or under [`UPLOAD_CHUNK_BYTES`] the file goes up in a single
+    /// conditional put, which is what makes an existing key detectable, and is
+    /// the path almost every part file takes. A larger file is streamed a
+    /// chunk at a time, because a publish that costs its file size is what put
+    /// resident memory at the cgroup limit. `put_multipart` carries no put
+    /// mode, so the existing-key check is explicit there instead of a
+    /// conditional create. That window has no second writer in it: part keys
+    /// carry a uuid, and a competing writer is fenced at the manifest CAS
+    /// before it can publish.
+    async fn upload_object(
+        &self,
+        local_path: &Path,
+        len: u64,
+        object_path: &ObjectPath,
+        kind: &str,
+        subject: &str,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let (_in_flight, in_flight) = UploadInFlight::enter();
+        if len <= UPLOAD_CHUNK_BYTES {
+            let bytes = tokio::fs::read(local_path).await.map_err(|error| {
+                format!(
+                    "failed to read {kind} file {}: {error}",
+                    local_path.display()
+                )
+            })?;
+            match self
+                .store
+                .put_opts(
+                    object_path,
+                    bytes.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    self.verify_existing_object(local_path, len, object_path, subject)
+                        .await?;
+                }
+                Err(error) => return Err(format!("failed to upload {subject}: {error}")),
+            }
+            tracing::info!(
+                subject,
+                bytes = len,
+                chunk_bytes = 0,
+                chunks = 1,
+                in_flight,
+                upload_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "upload put the file whole"
+            );
+            return Ok(());
+        }
+
+        if self.store.head(object_path).await.is_ok() {
+            self.verify_existing_object(local_path, len, object_path, subject)
+                .await?;
+            tracing::info!(
+                subject,
+                bytes = len,
+                chunk_bytes = UPLOAD_CHUNK_BYTES,
+                chunks = 0,
+                in_flight,
+                upload_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "upload found the file already stored"
+            );
+            return Ok(());
+        }
+
+        let mut upload = self
+            .store
+            .put_multipart(object_path)
+            .await
+            .map_err(|error| format!("failed to start the upload for {subject}: {error}"))?;
+        let chunks = match self.stream_into(local_path, len, &mut upload).await {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                upload.abort().await.ok();
+                return Err(format!("failed to upload {subject}: {error}"));
+            }
+        };
+        upload
+            .complete()
+            .await
+            .map_err(|error| format!("failed to finish the upload for {subject}: {error}"))?;
+        tracing::info!(
+            subject,
+            bytes = len,
+            chunk_bytes = UPLOAD_CHUNK_BYTES,
+            chunks,
+            in_flight,
+            upload_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "upload streamed the file"
+        );
+        Ok(())
+    }
+
+    /// Feed the upload one chunk at a time, awaiting each. Parts are sent
+    /// rather than queued so that exactly one chunk is resident: awaiting them
+    /// together would be faster and would cost the file size again.
+    async fn stream_into(
+        &self,
+        local_path: &Path,
+        len: u64,
+        upload: &mut Box<dyn MultipartUpload>,
+    ) -> Result<u32, String> {
+        let mut file = tokio::fs::File::open(local_path)
+            .await
+            .map_err(|error| format!("{}: {error}", local_path.display()))?;
+        let mut sent = 0;
+        let mut chunks = 0;
+        while sent < len {
+            let want = UPLOAD_CHUNK_BYTES.min(len - sent) as usize;
+            let mut chunk = vec![0u8; want];
+            file.read_exact(&mut chunk)
+                .await
+                .map_err(|error| format!("{}: {error}", local_path.display()))?;
+            upload
+                .put_part(chunk.into())
+                .await
+                .map_err(|error| error.to_string())?;
+            sent += want as u64;
+            chunks += 1;
+        }
+        Ok(chunks)
+    }
+
+    /// The bytes already under this key must be the ones this publish would
+    /// write, which is the resume-after-a-crash case. Both sides are read in
+    /// [`UPLOAD_CHUNK_BYTES`] ranges so that the check costs a chunk rather
+    /// than two copies of the object.
+    async fn verify_existing_object(
+        &self,
+        local_path: &Path,
+        len: u64,
+        object_path: &ObjectPath,
+        subject: &str,
+    ) -> Result<(), String> {
+        let remote = self
+            .store
+            .head(object_path)
+            .await
+            .map_err(|error| format!("failed to verify existing object for {subject}: {error}"))?;
+        if remote.size != len {
+            return Err(format!("immutable object collision for {subject}"));
+        }
+        let mut file = tokio::fs::File::open(local_path)
+            .await
+            .map_err(|error| format!("failed to re-read {subject}: {error}"))?;
+        let mut offset = 0;
+        while offset < len {
+            let want = UPLOAD_CHUNK_BYTES.min(len - offset);
+            let stored = self
+                .store
+                .get_opts(
+                    object_path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(offset..offset + want)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    format!("failed to read existing object for {subject}: {error}")
+                })?
+                .bytes()
+                .await
+                .map_err(|error| {
+                    format!("failed to read existing object for {subject}: {error}")
+                })?;
+            let mut chunk = vec![0u8; want as usize];
+            file.read_exact(&mut chunk)
+                .await
+                .map_err(|error| format!("failed to re-read {subject}: {error}"))?;
+            if stored.as_ref() != chunk.as_slice() {
+                return Err(format!("immutable object collision for {subject}"));
+            }
+            offset += want;
+        }
+        Ok(())
+    }
+}
+
 impl ObjectStorage {
     async fn upload_metric_part(&self, part: &SeriesPart) -> Result<(), String> {
         let descriptor = MetricManifestPart::from(part);
@@ -15,61 +230,14 @@ impl ObjectStorage {
                     local_path.display()
                 ));
             }
-            let bytes = tokio::fs::read(&local_path).await.map_err(|error| {
-                format!(
-                    "failed to read metric part file {}: {error}",
-                    local_path.display()
-                )
-            })?;
-            match self
-                .store
-                .put_opts(
-                    &self.metric_part_path(&descriptor, file),
-                    bytes.into(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // The put owns the buffer now. Re-read for the comparison
-                    // rather than keep a second copy of every part alive for a
-                    // branch a healthy publish never takes.
-                    let local = tokio::fs::read(&local_path).await.map_err(|error| {
-                        format!(
-                            "failed to re-read metric part file {}: {error}",
-                            local_path.display()
-                        )
-                    })?;
-                    let remote = self
-                        .store
-                        .get(&self.metric_part_path(&descriptor, file))
-                        .await
-                        .map_err(|error| {
-                            format!("failed to verify existing metric object: {error}")
-                        })?
-                        .bytes()
-                        .await
-                        .map_err(|error| {
-                            format!("failed to read existing metric object: {error}")
-                        })?;
-                    if remote.as_ref() != local.as_slice() {
-                        return Err(format!(
-                            "immutable object collision for metric part {} file {file}",
-                            part.meta.id
-                        ));
-                    }
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "failed to upload metric part {} file {file}: {error}",
-                        part.meta.id
-                    ));
-                }
-            }
+            self.upload_object(
+                &local_path,
+                metadata.len(),
+                &self.metric_part_path(&descriptor, file),
+                "metric part",
+                &format!("metric part {} file {file}", part.meta.id),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -309,61 +477,14 @@ impl ObjectStorage {
                     local_path.display()
                 ));
             }
-            let bytes = tokio::fs::read(&local_path).await.map_err(|error| {
-                format!(
-                    "failed to read trace part file {}: {error}",
-                    local_path.display()
-                )
-            })?;
-            match self
-                .store
-                .put_opts(
-                    &self.trace_part_path(&descriptor, file),
-                    bytes.into(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // The put owns the buffer now. Re-read for the comparison
-                    // rather than keep a second copy of every part alive for a
-                    // branch a healthy publish never takes.
-                    let local = tokio::fs::read(&local_path).await.map_err(|error| {
-                        format!(
-                            "failed to re-read trace part file {}: {error}",
-                            local_path.display()
-                        )
-                    })?;
-                    let remote = self
-                        .store
-                        .get(&self.trace_part_path(&descriptor, file))
-                        .await
-                        .map_err(|error| {
-                            format!("failed to verify existing trace object: {error}")
-                        })?
-                        .bytes()
-                        .await
-                        .map_err(|error| {
-                            format!("failed to read existing trace object: {error}")
-                        })?;
-                    if remote.as_ref() != local.as_slice() {
-                        return Err(format!(
-                            "immutable object collision for trace part {} file {file}",
-                            part.meta.id
-                        ));
-                    }
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "failed to upload trace part {} file {file}: {error}",
-                        part.meta.id
-                    ));
-                }
-            }
+            self.upload_object(
+                &local_path,
+                metadata.len(),
+                &self.trace_part_path(&descriptor, file),
+                "trace part",
+                &format!("trace part {} file {file}", part.meta.id),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -617,6 +738,7 @@ impl ObjectStorage {
             write_upload_marker(part)?;
         }
         for part in added {
+            tracing::info!(part = %part.meta.id, "publish is uploading a part");
             self.upload_part(part).await?;
         }
 

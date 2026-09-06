@@ -5,7 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutMode, PutOptions, PutResult, UpdateVersion};
+use object_store::{
+    GetOptions, GetRange, MultipartUpload, ObjectStore, PutMode, PutOptions, PutResult,
+    UpdateVersion,
+};
+use tokio::io::AsyncReadExt;
 use serde::{Deserialize, Serialize};
 
 use crate::part::{self, DATA_FILE, INDEX_FILE, META_FILE, Part};

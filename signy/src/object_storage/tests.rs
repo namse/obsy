@@ -767,6 +767,48 @@
     }
 
     #[tokio::test]
+    async fn a_file_past_the_chunk_streams_up_whole_and_compares_in_ranges() {
+        let storage = ObjectStorage::in_memory();
+        let dir = temp_dir("streamed-upload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("big.bin");
+        // Past UPLOAD_CHUNK_BYTES and not a multiple of it, so the last chunk
+        // is a short one.
+        let len = UPLOAD_CHUNK_BYTES as usize + 7 * 1024 * 1024 + 13;
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&local, &body).unwrap();
+        let key = ObjectPath::from("streamed/big.bin");
+
+        storage
+            .upload_object(&local, len as u64, &key, "part", "part big file big.bin")
+            .await
+            .unwrap();
+
+        let stored = storage.store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(stored.len(), len, "a streamed upload must store every byte");
+        assert_eq!(stored.as_ref(), body.as_slice(), "and store them unchanged");
+
+        // Publishing the same part again is the resume path: it must accept
+        // the identical object rather than fail on the existing key.
+        storage
+            .upload_object(&local, len as u64, &key, "part", "part big file big.bin")
+            .await
+            .unwrap();
+
+        let mut different = body.clone();
+        *different.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&local, &different).unwrap();
+        let error = storage
+            .upload_object(&local, len as u64, &key, "part", "part big file big.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("immutable object collision"),
+            "a differing byte past the first chunk must still be caught: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn file_backend_can_update_an_existing_manifest() {
         let remote = temp_dir("file-backend");
         let url = url::Url::from_directory_path(&remote).unwrap();

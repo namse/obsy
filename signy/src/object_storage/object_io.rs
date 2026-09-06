@@ -5,6 +5,11 @@
 /// documents for every part of a multipart upload but the last.
 const UPLOAD_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Above this a streamed upload is logged at info. Below it the line is a
+/// debug: a day of merge output is thousands of ordinary uploads, and the
+/// question a log is kept for is whether a large one ever meets a memory peak.
+const NOTEWORTHY_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Uploads running at once, so a memory peak can be read against how many
 /// bounded buffers were live rather than against one.
 static UPLOADS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
@@ -72,11 +77,9 @@ impl ObjectStorage {
                 }
                 Err(error) => return Err(format!("failed to upload {subject}: {error}")),
             }
-            tracing::info!(
+            tracing::debug!(
                 subject,
                 bytes = len,
-                chunk_bytes = 0,
-                chunks = 1,
                 in_flight,
                 upload_ms = started.elapsed().as_secs_f64() * 1000.0,
                 "upload put the file whole"
@@ -107,23 +110,40 @@ impl ObjectStorage {
         let chunks = match self.stream_into(local_path, len, &mut upload).await {
             Ok(chunks) => chunks,
             Err(error) => {
+                tracing::warn!(subject, bytes = len, %error, "aborting a streamed upload");
                 upload.abort().await.ok();
                 return Err(format!("failed to upload {subject}: {error}"));
             }
         };
-        upload
-            .complete()
-            .await
-            .map_err(|error| format!("failed to finish the upload for {subject}: {error}"))?;
-        tracing::info!(
-            subject,
-            bytes = len,
-            chunk_bytes = UPLOAD_CHUNK_BYTES,
-            chunks,
-            in_flight,
-            upload_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "upload streamed the file"
-        );
+        if let Err(error) = upload.complete().await {
+            upload.abort().await.ok();
+            return Err(format!("failed to finish the upload for {subject}: {error}"));
+        }
+        let upload_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // Every part over the chunk streams, which is most merge output. The
+        // ones worth a line are the large, the slow and the overlapping --
+        // those are what a memory peak has to be read against.
+        if len >= NOTEWORTHY_UPLOAD_BYTES || upload_ms > 1000.0 || in_flight > 1 {
+            tracing::info!(
+                subject,
+                bytes = len,
+                chunk_bytes = UPLOAD_CHUNK_BYTES,
+                chunks,
+                in_flight,
+                upload_ms,
+                "upload streamed the file"
+            );
+        } else {
+            tracing::debug!(
+                subject,
+                bytes = len,
+                chunk_bytes = UPLOAD_CHUNK_BYTES,
+                chunks,
+                in_flight,
+                upload_ms,
+                "upload streamed the file"
+            );
+        }
         Ok(())
     }
 
@@ -205,6 +225,7 @@ impl ObjectStorage {
                 .await
                 .map_err(|error| format!("failed to re-read {subject}: {error}"))?;
             if stored.as_ref() != chunk.as_slice() {
+                tracing::warn!(subject, offset, "stored object differs from the local file");
                 return Err(format!("immutable object collision for {subject}"));
             }
             offset += want;
@@ -738,7 +759,6 @@ impl ObjectStorage {
             write_upload_marker(part)?;
         }
         for part in added {
-            tracing::info!(part = %part.meta.id, "publish is uploading a part");
             self.upload_part(part).await?;
         }
 

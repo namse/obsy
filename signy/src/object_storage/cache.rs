@@ -26,13 +26,22 @@ impl ObjectStorage {
                 .store
                 .put_opts(
                     &self.part_path(&descriptor, file),
-                    bytes.clone().into(),
+                    bytes.into(),
                     options,
                 )
                 .await
             {
                 Ok(_) => {}
                 Err(object_store::Error::AlreadyExists { .. }) => {
+                    // The put owns the buffer now. Re-read for the comparison
+                    // rather than keep a second copy of every part alive for a
+                    // branch a healthy publish never takes.
+                    let local = tokio::fs::read(&local_path).await.map_err(|error| {
+                        format!(
+                            "failed to re-read part file {}: {error}",
+                            local_path.display()
+                        )
+                    })?;
                     let remote = self
                         .store
                         .get(&self.part_path(&descriptor, file))
@@ -51,7 +60,7 @@ impl ObjectStorage {
                                 part.meta.id
                             )
                         })?;
-                    if remote.as_ref() != bytes.as_slice() {
+                    if remote.as_ref() != local.as_slice() {
                         return Err(format!(
                             "immutable object collision for part {} file {file}",
                             part.meta.id

@@ -6,15 +6,34 @@ fn validate_cache_root(root: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(root).map_err(|error| error.to_string())
 }
 
-fn ensure_safe_directory_chain(root: &Path, components: &[&str]) -> Result<PathBuf, String> {
+/// Walk `components` under `root`, refusing anything that is a symlink, is not
+/// a directory, or escapes the root.
+///
+/// `create` is what separates a caller that is about to write from one that is
+/// only asking where a part would live. Creating on the read side is what left
+/// an empty part directory behind every restore that could not fetch its
+/// files, and startup reconciliation refuses a part directory with no
+/// metadata.
+fn ensure_safe_directory_chain(
+    root: &Path,
+    components: &[&str],
+    create: bool,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let canonical_root = validate_cache_root(root)?;
     let mut current = root.to_path_buf();
+    // Nothing below a directory that is absent can exist, so the walk keeps
+    // appending components to answer "where would this live" without touching
+    // the filesystem again.
+    let mut absent = false;
     for component in components {
         if !is_safe_path_component(component) {
             return Err(format!("unsafe cache path component {component:?}"));
         }
         current.push(component);
+        if absent {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -29,7 +48,16 @@ fn ensure_safe_directory_chain(root: &Path, components: &[&str]) -> Result<PathB
                 ));
             }
             Ok(_) => {}
+            // A path that does not exist is the answer to "where would this
+            // part live", not a directory to bring into being. Materialising
+            // it here is what left an empty part directory behind every
+            // restore that could not fetch its files, and startup
+            // reconciliation refuses a part directory with no metadata.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    absent = true;
+                    continue;
+                }
                 std::fs::create_dir(&current).map_err(|error| {
                     format!(
                         "failed to create cache directory {}: {error}",
@@ -66,7 +94,8 @@ fn ensure_existing_cache_dir(canonical_root: &Path, path: &Path) -> Result<(), S
 }
 
 fn cache_part_dir(parts_root: &Path, descriptor: &ManifestPart) -> Result<PathBuf, String> {
-    let dir = ensure_safe_directory_chain(parts_root, &[&descriptor.partition, &descriptor.id])?;
+    let dir =
+        ensure_safe_directory_chain(parts_root, &[&descriptor.partition, &descriptor.id], false)?;
     for file in [
         DATA_FILE,
         INDEX_FILE,

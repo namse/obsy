@@ -809,6 +809,107 @@
     }
 
     #[tokio::test]
+    async fn a_failed_restore_leaves_no_part_directory_behind() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("failed-restore").join("parts");
+        let local = part::flush_rows(vec![row("gone")], &root, 100).unwrap();
+        storage.publish(&local, &[]).await.unwrap();
+        let descriptor = ManifestPart::from(&local[0]);
+        let dir = local[0].dir.clone();
+
+        // What retention leaves behind: the manifest still names the part, the
+        // objects under it are gone, and the local copy has been evicted.
+        for file in PART_FILES {
+            storage
+                .store
+                .delete(&storage.part_path(&descriptor, file))
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let ids: HashSet<String> = [descriptor.id.clone()].into_iter().collect();
+        let error = storage.restore_parts(&root, &ids).await.unwrap_err();
+        assert!(
+            error.contains("failed to download part"),
+            "the restore must report the missing object: {error}"
+        );
+        assert!(
+            !dir.exists(),
+            "a restore that could not fetch anything must not leave {} behind: startup reconciliation refuses a part directory with no metadata",
+            dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_commits_a_whole_part_or_nothing_at_all() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("restore-whole").join("parts");
+        let local = part::flush_rows(vec![row("kept")], &root, 100).unwrap();
+        storage.publish(&local, &[]).await.unwrap();
+        let descriptor = ManifestPart::from(&local[0]);
+        let dir = local[0].dir.clone();
+        let ids: HashSet<String> = [descriptor.id.clone()].into_iter().collect();
+
+        // A local part that is already valid opens without being touched.
+        storage.restore_parts(&root, &ids).await.unwrap();
+        assert!(dir.join(META_FILE).exists());
+
+        // Evicted and restored: the directory comes back whole.
+        std::fs::remove_dir_all(&dir).unwrap();
+        storage.restore_parts(&root, &ids).await.unwrap();
+        for file in PART_FILES {
+            assert!(
+                dir.join(file).exists(),
+                "a committed part directory holds {file}"
+            );
+        }
+
+        // The objects go away under it. Every retry must fail and leave the
+        // final namespace exactly as it found it -- no directory, and so no
+        // debris to accumulate.
+        std::fs::remove_dir_all(&dir).unwrap();
+        for file in PART_FILES {
+            storage
+                .store
+                .delete(&storage.part_path(&descriptor, file))
+                .await
+                .unwrap();
+        }
+        for attempt in 0..3 {
+            storage.restore_parts(&root, &ids).await.unwrap_err();
+            assert!(
+                !dir.exists(),
+                "attempt {attempt} left a part directory behind"
+            );
+        }
+        let partition = dir.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(partition)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "failed restores must not accumulate anything: {leftovers:?}"
+        );
+
+        // The invariant startup depends on, stated the way startup reads it:
+        // a part directory that exists holds its metadata. Reconciliation
+        // refuses one that does not and retries until its budget is gone.
+        for partition in std::fs::read_dir(&root).unwrap().flatten() {
+            if !partition.path().is_dir() || partition.file_name() == ".tmp" {
+                continue;
+            }
+            for part_dir in std::fs::read_dir(partition.path()).unwrap().flatten() {
+                assert!(
+                    part_dir.path().join(META_FILE).exists(),
+                    "a part directory with no metadata is observable at {}",
+                    part_dir.path().display()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn file_backend_can_update_an_existing_manifest() {
         let remote = temp_dir("file-backend");
         let url = url::Url::from_directory_path(&remote).unwrap();

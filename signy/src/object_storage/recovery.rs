@@ -400,11 +400,15 @@ fn metric_cache_part_dir(
     std::fs::create_dir_all(metrics_root).map_err(|error| error.to_string())?;
     let canonical_root = validate_cache_root(metrics_root)?;
     let mut current = metrics_root.to_path_buf();
+    let mut absent = false;
     for component in [&descriptor.partition, &descriptor.id] {
         if !is_safe_path_component(component) {
             return Err(format!("unsafe metric cache path component {component:?}"));
         }
         current.push(component);
+        if absent {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -419,8 +423,11 @@ fn metric_cache_part_dir(
                 ));
             }
             Ok(_) => {}
+            // Answering "where would this part live" must not create it --
+            // see `ensure_safe_directory_chain`.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|error| error.to_string())?;
+                absent = true;
+                continue;
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -467,11 +474,15 @@ fn trace_cache_part_dir(
     std::fs::create_dir_all(traces_root).map_err(|error| error.to_string())?;
     let canonical_root = validate_cache_root(traces_root)?;
     let mut current = traces_root.to_path_buf();
+    let mut absent = false;
     for component in [&descriptor.partition, &descriptor.id] {
         if !is_safe_path_component(component) {
             return Err(format!("unsafe trace cache path component {component:?}"));
         }
         current.push(component);
+        if absent {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -486,8 +497,11 @@ fn trace_cache_part_dir(
                 ));
             }
             Ok(_) => {}
+            // Answering "where would this part live" must not create it --
+            // see `ensure_safe_directory_chain`.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|error| error.to_string())?;
+                absent = true;
+                continue;
             }
             Err(error) => return Err(error.to_string()),
         }

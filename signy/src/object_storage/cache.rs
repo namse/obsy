@@ -307,6 +307,11 @@ impl ObjectStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
+        // The partition directory, not the part's own: a part directory that
+        // exists before its files do is exactly what this commit replaces.
+        if let Some(parent) = final_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
         std::fs::rename(tmp_dir, &final_dir)
             .map_err(|error| format!("failed to commit cached part {}: {error}", descriptor.id))?;
         // A catalog-only download restores no body, so it buys no later scan

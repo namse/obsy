@@ -101,7 +101,7 @@ impl StagingDir {
             .fetch_add(1, Ordering::Relaxed)
             .to_string();
         let dir =
-            ensure_safe_directory_chain(cache_root, &[".tmp", "remote", &attempt, partition, id])?;
+            ensure_safe_directory_chain(cache_root, &[".tmp", "remote", &attempt, partition, id], true)?;
         let root = dir
             .parent()
             .and_then(Path::parent)

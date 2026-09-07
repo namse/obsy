@@ -144,6 +144,61 @@ async fn retention_once(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Retire expired log parts: first from the registry readers plan against,
+/// then from the manifest a restore validates against.
+///
+/// The order is the contract. A reader plans under the lifecycle read guard
+/// and restores under it again, so the registry is the side that is serialised
+/// against it -- the write guard cannot be taken while a reader holds the read
+/// guard, and a reader that re-plans afterwards no longer asks for the part.
+/// Writing the manifest first left a window where a reader still planning from
+/// the registry asked the restore for a part the manifest had already dropped,
+/// and that fails the whole query rather than returning less.
+///
+/// Failing on the manifest write now leaves the part retired locally and still
+/// in the manifest -- retention lagging rather than data vanishing under a
+/// reader -- and a restart rebuilds the registry from the manifest, so the
+/// part returns and the next tick retires it again.
+async fn retire_log_parts(
+    registry: &PartRegistry,
+    cache: &RemoteCache,
+    config: &Config,
+    ids: &[String],
+) -> Result<(), String> {
+    unregister_log_parts(registry, ids).await;
+    drop_log_parts_from_manifest(cache, config, ids).await
+}
+
+/// Stop planning reads against these parts, under the lifecycle write guard.
+async fn unregister_log_parts(registry: &PartRegistry, ids: &[String]) {
+    let _guard =
+        crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock()).await;
+    registry.unregister(ids);
+}
+
+/// Drop these parts from the manifest, outside the guard: this is a network
+/// round trip and holding lifecycle writers for it is what the read/re-plan
+/// protocol exists to avoid.
+async fn drop_log_parts_from_manifest(
+    cache: &RemoteCache,
+    config: &Config,
+    ids: &[String],
+) -> Result<(), String> {
+    match tokio::time::timeout(config.max_retention_runtime, cache.storage.publish(&[], ids)).await
+    {
+        Ok(Ok(_)) => cache.record_remote_success(),
+        Ok(Err(error)) => {
+            cache.record_remote_failure();
+            return Err(error);
+        }
+        Err(_) => {
+            cache.record_remote_failure();
+            return Err("object-store retention timed out".to_string());
+        }
+    }
+    Ok(())
+}
+
 async fn retention_once_at(
     registry: &PartRegistry,
     trace_registry: &TraceRegistry,
@@ -307,33 +362,7 @@ async fn retention_once_at(
 
     if let Some(cache) = remote_cache {
         if !removed_log_ids.is_empty() {
-            let ids = removed_log_ids.clone();
-            match tokio::time::timeout(
-                config.max_retention_runtime,
-                cache.storage.publish(&[], &ids),
-            )
-            .await
-            {
-                Ok(Ok(_)) => cache.record_remote_success(),
-                Ok(Err(error)) => {
-                    cache.record_remote_failure();
-                    return Err(error);
-                }
-                Err(_) => {
-                    cache.record_remote_failure();
-                    return Err("object-store retention timed out".to_string());
-                }
-            }
-            // Retire the descriptors as soon as *their own* manifest write
-            // lands, not after the trace side has also succeeded. A failure
-            // below must not leave a part that is gone from the manifest but
-            // still advertised by the registry: once the grace period passes,
-            // the orphan collector removes its objects and the restore path
-            // has nothing left to serve.
-            let _guard =
-                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
-                    .await;
-            registry.unregister(&removed_log_ids);
+            retire_log_parts(registry, cache, config, &removed_log_ids).await?;
         }
         if !removed_trace_ids.is_empty() {
             let descriptors: Vec<_> = trace_parts
@@ -341,6 +370,14 @@ async fn retention_once_at(
                 .filter(|(part, _)| removed_trace_ids.iter().any(|id| id == &part.id))
                 .map(|(part, _)| part.clone())
                 .collect();
+            // Registry first, then the manifest -- see `retire_log_parts`.
+            {
+                let _guard = crate::part_registry::PartRegistry::write_without_convoy(
+                    registry.operation_lock(),
+                )
+                .await;
+                trace_registry.unregister(&removed_trace_ids);
+            }
             match tokio::time::timeout(
                 config.max_retention_runtime,
                 cache.storage.remove_trace_parts(&descriptors),
@@ -357,10 +394,6 @@ async fn retention_once_at(
                     return Err("trace object-store retention timed out".to_string());
                 }
             }
-            let _guard =
-                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
-                    .await;
-            trace_registry.unregister(&removed_trace_ids);
         }
         // The metric manifest last, extending the log-then-trace ordering:
         // each signal's descriptors retire as soon as their own manifest write
@@ -372,6 +405,14 @@ async fn retention_once_at(
                 .filter(|(part, _)| removed_metric_ids.iter().any(|id| id == &part.id))
                 .map(|(part, _)| part.clone())
                 .collect();
+            // Registry first, then the manifest -- see `retire_log_parts`.
+            {
+                let _guard = crate::part_registry::PartRegistry::write_without_convoy(
+                    registry.operation_lock(),
+                )
+                .await;
+                series_registry.unregister(&removed_metric_ids);
+            }
             match tokio::time::timeout(
                 config.max_retention_runtime,
                 cache.storage.remove_metric_parts(&descriptors),
@@ -388,10 +429,6 @@ async fn retention_once_at(
                     return Err("metric object-store retention timed out".to_string());
                 }
             }
-            let _guard =
-                crate::part_registry::PartRegistry::write_without_convoy(registry.operation_lock())
-                    .await;
-            series_registry.unregister(&removed_metric_ids);
         }
     }
 
@@ -423,6 +460,8 @@ async fn retention_once_at(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::object_storage::ObjectStorage;
+    use std::collections::HashSet;
     use crate::memtable::Labels;
     use crate::part::{self, Row};
     use crate::tenant::TenantId;
@@ -1168,5 +1207,90 @@ mod tests {
 
         assert_eq!(registry.part_count(), 1);
         assert!(parts[0].dir.exists());
+    }
+
+    /// The lifecycle contract at the seam the reader was built around: it
+    /// plans from the registry under the read guard, retention runs in the
+    /// deliberate re-plan gap, and the reader must not then be asked to
+    /// restore a part the manifest no longer has.
+    ///
+    /// The two retirement steps are driven separately because the hazard lives
+    /// between them: run back to back, either order leaves the reader nothing
+    /// to trip over.
+    async fn reader_across_retirement(registry_first: bool) -> Result<(), String> {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let parts_root = temp_root("replan-gap").join("parts");
+        let parts =
+            part::flush_rows(vec![row_for("t", 1_700_000_000_000_000_000)], &parts_root, 100)
+                .unwrap();
+        storage.publish(&parts, &[]).await.unwrap();
+        let ids = vec![parts[0].meta.id.clone()];
+
+        let registry = Arc::new(PartRegistry::new());
+        registry.register(parts).unwrap();
+        let cache = Arc::new(RemoteCache::new(storage, parts_root.clone()));
+        let config = Config::default();
+
+        let planning = registry.clone();
+        let required = move || -> HashSet<String> {
+            planning
+                .snapshot()
+                .into_iter()
+                .map(|reader| reader.meta().id.clone())
+                .collect()
+        };
+        // Nothing is local, so everything planned is asked of the restore.
+        let missing = |required: &HashSet<String>| required.clone();
+
+        let retiring = registry.clone();
+        let retiring_cache = cache.clone();
+        let retiring_config = config.clone();
+        crate::remote_lifecycle::pin_remote_parts(
+            registry.operation_lock(),
+            Some(cache.clone()),
+            required,
+            missing,
+            crate::remote_lifecycle::RemoteDomain::Logs,
+            Duration::from_secs(30),
+            move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if registry_first {
+                            unregister_log_parts(&retiring, &ids).await;
+                        } else {
+                            drop_log_parts_from_manifest(&retiring_cache, &retiring_config, &ids)
+                                .await
+                                .unwrap();
+                        }
+                    })
+                });
+                Ok(())
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retiring_from_the_registry_first_leaves_the_reader_whole() {
+        reader_across_retirement(true)
+            .await
+            .expect("a re-planned reader must simply drop the retired part");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retiring_from_the_manifest_first_breaks_the_reader() {
+        // Why `retire_log_parts` unregisters before it writes the manifest:
+        // the other order leaves the reader planning a part the restore then
+        // refuses, which fails the query rather than returning less.
+        let error = reader_across_retirement(false)
+            .await
+            .expect_err("the manifest-first order must break the reader");
+        assert!(
+            error.contains("no longer present in the object-store manifest"),
+            "expected the restore to refuse the retired part, got: {error}"
+        );
     }
 }

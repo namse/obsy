@@ -909,6 +909,107 @@
         }
     }
 
+    /// The contract the orphan collector's own comment states: an object that
+    /// has left the active set survives `grace_period` from the moment it left
+    /// it. Not from when it was written -- every part retention retires is
+    /// older than the grace by construction, so measuring from the write time
+    /// gives a retired object no grace at all.
+    ///
+    /// Time is injected rather than waited on, and `now` is pushed far past
+    /// the object's write time so that the write-time check cannot be what
+    /// keeps it alive.
+    #[tokio::test]
+    async fn a_retired_object_survives_its_grace_however_old_the_object_is() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("gc-grace").join("parts");
+        let local = part::flush_rows(vec![row("retired")], &root, 100).unwrap();
+        storage.publish(&local, &[]).await.unwrap();
+        let descriptor = ManifestPart::from(&local[0]);
+        let key = storage.part_path(&descriptor, DATA_FILE);
+        let grace = std::time::Duration::from_secs(300);
+
+        // Long enough after the write that the object counts as old.
+        let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        storage
+            .publish(&[], &[descriptor.id.clone()])
+            .await
+            .unwrap();
+
+        storage
+            .garbage_collect_orphans_at(grace, retired_at)
+            .await
+            .unwrap();
+        assert!(
+            storage.store.head(&key).await.is_ok(),
+            "an object retired this instant must not be collected in the same pass"
+        );
+
+        storage
+            .garbage_collect_orphans_at(grace, retired_at + chrono::Duration::seconds(299))
+            .await
+            .unwrap();
+        assert!(
+            storage.store.head(&key).await.is_ok(),
+            "it must still be there a second before its grace is up"
+        );
+
+        storage
+            .garbage_collect_orphans_at(grace, retired_at + chrono::Duration::seconds(301))
+            .await
+            .unwrap();
+        assert!(
+            storage.store.head(&key).await.is_err(),
+            "and it must be collected once the grace has passed"
+        );
+    }
+
+    /// The grace is a property of the store, not of the process that noticed
+    /// the retirement: restarting must not hand a retired object a fresh
+    /// grace, and must not collect it early either.
+    #[tokio::test]
+    async fn the_grace_outlives_the_process_that_started_it() {
+        let dir = temp_dir("gc-grace-restart");
+        let url = format!("file://{}", dir.display());
+        let root = dir.join("cache").join("parts");
+        let grace = std::time::Duration::from_secs(300);
+
+        let storage = ObjectStorage::from_url(&url).unwrap();
+        let local = part::flush_rows(vec![row("retired")], &root, 100).unwrap();
+        storage.publish(&local, &[]).await.unwrap();
+        let descriptor = ManifestPart::from(&local[0]);
+        let key = storage.part_path(&descriptor, DATA_FILE);
+
+        let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        storage
+            .publish(&[], &[descriptor.id.clone()])
+            .await
+            .unwrap();
+        storage
+            .garbage_collect_orphans_at(grace, retired_at)
+            .await
+            .unwrap();
+
+        // A new instance over the same store is what a restart looks like.
+        let restarted = ObjectStorage::from_url(&url).unwrap();
+        restarted
+            .garbage_collect_orphans_at(grace, retired_at + chrono::Duration::seconds(60))
+            .await
+            .unwrap();
+        assert!(
+            restarted.store.head(&key).await.is_ok(),
+            "a restart must not collect an object still inside its grace"
+        );
+
+        restarted
+            .garbage_collect_orphans_at(grace, retired_at + chrono::Duration::seconds(301))
+            .await
+            .unwrap();
+        assert!(
+            restarted.store.head(&key).await.is_err(),
+            "and must still collect it once the grace it started with has passed"
+        );
+    }
+
     #[tokio::test]
     async fn file_backend_can_update_an_existing_manifest() {
         let remote = temp_dir("file-backend");

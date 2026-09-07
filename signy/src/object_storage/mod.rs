@@ -126,6 +126,10 @@ impl Drop for StagingDir {
 
 const MAX_CAS_ATTEMPTS: usize = 16;
 const FLUSH_TRANSACTION_FILE: &str = "flush.txn";
+/// Where the orphan collector remembers when it first saw an object leave the
+/// active set. Nothing but the collector reads it, so retirement time never
+/// becomes a concept every manifest reader has to carry.
+const GC_ORPHANS_FILE: &str = "gc-orphans.json";
 
 /// Prefix of the error `publish` returns when another writer already replaced
 /// the inputs of a replacement. The store is healthy and nothing was written:

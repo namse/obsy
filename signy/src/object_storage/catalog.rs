@@ -1099,6 +1099,35 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         &self,
         grace_period: std::time::Duration,
     ) -> Result<usize, String> {
+        self.garbage_collect_orphans_at(grace_period, chrono::Utc::now())
+            .await
+    }
+
+    /// Delete objects no manifest names any more, once they have been out of
+    /// the active set for `grace_period`.
+    ///
+    /// What the grace is for, now that retirement unregisters before it writes
+    /// the manifest and a reader can no longer plan a part the manifest has
+    /// dropped:
+    ///
+    /// * a restore or merge already past its plan, holding descriptors from
+    ///   the manifest it read;
+    /// * local cache state a crash left behind, which a restart reconciles
+    ///   against the store rather than against what it last had in memory;
+    /// * a manifest consumer that is not this process at all;
+    /// * a store whose listing lags its writes, where an object can be
+    ///   absent from `active` because the manifest read was stale;
+    /// * the gap between one lifecycle step and the next -- a publish whose
+    ///   objects are up but whose manifest write has not landed is held by
+    ///   the write-time half of the same check.
+    ///
+    /// So the value is a bound on how far behind the slowest of those may be,
+    /// not a guess.
+    pub(crate) async fn garbage_collect_orphans_at(
+        &self,
+        grace_period: std::time::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, String> {
         use futures_util::StreamExt;
 
         let manifest = self.load_manifest().await?;
@@ -1120,9 +1149,16 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                 active.insert(self.metric_part_path(part, file).to_string());
             }
         }
-        let cutoff = chrono::Utc::now()
+        let cutoff = now
             - chrono::Duration::from_std(grace_period)
                 .map_err(|error| format!("invalid garbage-collection grace period: {error}"))?;
+        // When each object was first seen outside the active set. An object
+        // retention retires is older than the grace by construction, so the
+        // write time alone gives it no grace at all -- that check is what
+        // keeps an upload that has not reached the manifest yet, and both have
+        // to hold before anything is deleted.
+        let mut first_orphaned = self.load_orphan_ledger().await?;
+        let mut seen = HashSet::new();
         let mut candidates = Vec::new();
         for prefix in [
             self.path("parts"),
@@ -1132,16 +1168,29 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             let mut stream = self.store.list(Some(&prefix));
             while let Some(item) = stream.next().await {
                 let meta = item.map_err(|error| format!("failed to list object store: {error}"))?;
-                if meta.last_modified < cutoff && !active.contains(meta.location.to_string().as_str())
-                {
+                let key = meta.location.to_string();
+                if active.contains(key.as_str()) {
+                    // Back in the active set, so any grace it had started is
+                    // no longer about anything.
+                    first_orphaned.remove(&key);
+                    continue;
+                }
+                seen.insert(key.clone());
+                let orphaned_at = *first_orphaned.entry(key).or_insert(now);
+                if meta.last_modified < cutoff && orphaned_at < cutoff {
                     candidates.push(meta.location);
                 }
             }
         }
+        // An object nobody lists any more takes its entry with it.
+        first_orphaned.retain(|key, _| seen.contains(key));
         let mut removed = 0;
         for location in candidates {
             match self.store.delete(&location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => removed += 1,
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                    first_orphaned.remove(&location.to_string());
+                    removed += 1;
+                }
                 Err(error) => {
                     return Err(format!(
                         "failed to delete orphan object {}: {error}",
@@ -1150,7 +1199,62 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                 }
             }
         }
+        self.store_orphan_ledger(&first_orphaned).await?;
         Ok(removed)
+    }
+
+    /// The collector's own record of when each object left the active set.
+    ///
+    /// A first sighting is an upper bound on the retirement it stands for --
+    /// the object left the manifest at or before the pass that noticed -- so
+    /// reading it this way can only hold an object longer, never delete one
+    /// early. It lives beside the manifests rather than under the part
+    /// prefixes so that the collector never lists its own bookkeeping.
+    async fn load_orphan_ledger(
+        &self,
+    ) -> Result<BTreeMap<String, chrono::DateTime<chrono::Utc>>, String> {
+        let bytes = match self.store.get(&self.path(GC_ORPHANS_FILE)).await {
+            Ok(result) => result
+                .bytes()
+                .await
+                .map_err(|error| format!("failed to read the orphan ledger: {error}"))?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(BTreeMap::new()),
+            Err(error) => return Err(format!("failed to load the orphan ledger: {error}")),
+        };
+        let raw: BTreeMap<String, String> = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid orphan ledger: {error}"))?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(key, at)| {
+                chrono::DateTime::parse_from_rfc3339(&at)
+                    .ok()
+                    .map(|at| (key, at.with_timezone(&chrono::Utc)))
+            })
+            .collect())
+    }
+
+    async fn store_orphan_ledger(
+        &self,
+        entries: &BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), String> {
+        let raw: BTreeMap<&str, String> = entries
+            .iter()
+            .map(|(key, at)| (key.as_str(), at.to_rfc3339()))
+            .collect();
+        let body = serde_json::to_vec(&raw)
+            .map_err(|error| format!("failed to encode the orphan ledger: {error}"))?;
+        self.store
+            .put_opts(
+                &self.path(GC_ORPHANS_FILE),
+                body.into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("failed to store the orphan ledger: {error}"))?;
+        Ok(())
     }
 
 }

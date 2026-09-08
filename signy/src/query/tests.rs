@@ -4581,3 +4581,102 @@ async fn the_api_fallback_lists_the_metric_routes() {
         "{body}"
     );
 }
+
+    /// A metric part's body is evictable — `SeriesPartReader::open` says so,
+    /// and `evict_metric_cache` acts on it — so any read that reaches the body
+    /// has to pin what it is about to read, the way the metric scan path does.
+    ///
+    /// Discovery reaches the body: a stored histogram is enumerated under the
+    /// names it answers as, which means decoding its chunk. Without a pin the
+    /// route opens a path the cache no longer holds and the caller is handed a
+    /// bare `No such file or directory` as a 500 — observed once in a
+    /// three-hour production-shaped run, on `/metrics/series`.
+    #[tokio::test]
+    async fn metric_discovery_restores_a_histogram_body_the_cache_evicted() {
+        let data_dir = temp_dir();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let parts_root = data_dir.join("parts");
+        let storage = Arc::new(crate::object_storage::ObjectStorage::in_memory());
+        let remote = Arc::new(crate::object_storage::RemoteCache::new(
+            storage.clone(),
+            parts_root.clone(),
+        ));
+        let metrics_root = remote.metric_parts_root();
+
+        // One part, one series, and that series a histogram: discovery cannot
+        // answer about it without decoding the chunk.
+        let source = crate::series::SeriesMemTable::new();
+        let labels = metric_labels("request_duration_seconds", &[("service", "api")]);
+        source.insert(vec![MetricSample {
+            tenant: test_tenant(),
+            labels: labels.clone(),
+            ts_ns: METRIC_ANCHOR_NS,
+            value: MetricValue::Histogram(crate::series::HistogramPoint {
+                bounds: vec![1.0, 5.0].into(),
+                cumulative: vec![1, 2],
+                sum: Some(3.0),
+                count: 3,
+            }),
+            kind: SampleKind::Cumulative,
+            datapoint_index: 0,
+        }]);
+        let snapshot = source.begin_flush();
+        let parts = crate::series_part::flush_series_snapshot(&snapshot, &metrics_root).unwrap();
+        source.commit_flush();
+        assert_eq!(parts.len(), 1);
+        storage.publish_metric_parts(&parts, &[]).await.unwrap();
+
+        let memtable = Arc::new(MemTable::new());
+        let registry = Arc::new(PartRegistry::new());
+        let trace_parts = Arc::new(crate::trace_registry::TraceRegistry::new(
+            registry.operation_lock(),
+        ));
+        let state = crate::test_support::state(
+            config.clone(),
+            memtable.clone(),
+            Arc::new(Journal::spawn(&config, memtable).unwrap()),
+            registry,
+            trace_parts,
+            Some(remote),
+        );
+        state.series_parts.register_opened(
+            crate::series_registry::SeriesRegistry::open_parts(parts.clone()).unwrap(),
+        );
+
+        // Eviction happens under a live reader, which is the production order:
+        // the registry opened the part while its body was there, and the
+        // disk-cache budget took the body afterwards.
+        let eligible: Vec<_> = parts.iter().map(|part| part.dir.clone()).collect();
+        storage
+            .evict_metric_cache(&metrics_root, 0, &eligible)
+            .unwrap();
+        assert!(
+            !parts[0].data_path().exists(),
+            "the fixture has to reach the query with the body evicted"
+        );
+
+        let window = format!(
+            "start={}&end={}",
+            METRIC_ANCHOR_NS,
+            METRIC_ANCHOR_NS + 60 * METRIC_SECOND_NS
+        );
+        let (status, body) = first_party_get(
+            state,
+            // A stored histogram is enumerated under the names it answers as,
+            // so this asks for one of those rather than the stored name.
+            &format!("/signy/api/v1/metrics/series?metric=request_duration_seconds_count&{window}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "discovery must restore the body it needs rather than fail on it: {body}"
+        );
+        assert!(
+            !ndjson_rows(&body).is_empty(),
+            "the restored histogram has to be enumerated: {body}"
+        );
+    }

@@ -127,6 +127,63 @@ fn discovery_lines<T: Ord + serde::Serialize>(
     DiscoveryAnswer { body, rows }
 }
 
+/// Hold the parts discovery is about to read, for as long as it reads them.
+///
+/// A metric part's body is evictable — `SeriesPartReader::open_cached` exists
+/// for exactly that, and `evict_metric_cache` acts on it — and this route
+/// reaches the body: a stored histogram is enumerated under the names it
+/// answers as, which means decoding its chunk. The scan path pins for the same
+/// reason. Discovery did not, so a body the disk-cache budget had taken back
+/// reached the caller as the reader's bare `No such file or directory`, a 500
+/// on a request the store could have answered.
+///
+/// The guard is the other half: it is the lock metric compaction takes to
+/// swap a tier and unlink its inputs, so holding it also keeps the directory
+/// under a reader that has already planned its read.
+///
+/// The required set is narrower than the scan's on purpose. Discovery needs a
+/// body only where a histogram row falls in the window, so asking a store of
+/// scalars what series it holds still restores nothing.
+async fn pin_discovery_parts(
+    state: &AppState,
+    tenant: &TenantId,
+    window: (i64, i64),
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+    let (start_ns, end_ns) = window;
+    let series_parts = state.series_parts.clone();
+    let owner = tenant.clone();
+    crate::remote_lifecycle::pin_remote_parts(
+        state.parts.operation_lock(),
+        state.remote_cache.clone(),
+        move || {
+            series_parts
+                .snapshot()
+                .into_iter()
+                .filter(|reader| {
+                    let meta = &reader.part().meta;
+                    meta.tenant_segment(&owner).is_some()
+                        && meta.overlaps_range(start_ns, end_ns)
+                })
+                .filter(|reader| {
+                    let catalog_window = reader.window(start_ns, end_ns);
+                    reader.tenant_catalog(&owner).iter().any(|row| {
+                        row.overlaps(catalog_window)
+                            && matches!(row.kind, crate::series_part::SeriesRowKind::Histogram)
+                    })
+                })
+                .map(|reader| reader.part().meta.id.clone())
+                .collect()
+        },
+        |required| state.series_parts.missing_data_ids(required),
+        crate::remote_lifecycle::RemoteDomain::Metrics,
+        state.config.max_metric_restore_runtime,
+        || Ok(()),
+        Some(state.metrics.clone()),
+    )
+    .await
+    .map_err(pin_error)
+}
+
 async fn metric_discovery(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -147,6 +204,9 @@ async fn metric_discovery(
     let Some(window) = metric_discovery_window(&state, &tenant, &params, now_ns)? else {
         return Ok(ndjson_response(String::new(), 0, 0));
     };
+    // Pinned before the slot, the order every read surface uses: a restore is
+    // network wait and must not hold a tenant's query slot while it waits.
+    let _pinned = pin_discovery_parts(&state, &tenant, window).await?;
     let _slot = state.tenant_quota.begin_query(&tenant).map_err(|error| {
         ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
     })?;

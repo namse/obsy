@@ -1629,12 +1629,30 @@ impl SeriesPartReader {
     }
 
     fn read_chunk_bytes(&self, location: ChunkRef) -> Result<Vec<u8>, String> {
-        let mut file = fs::File::open(self.part.data_path()).map_err(|error| error.to_string())?;
+        // The body is opened by path on every chunk read rather than held
+        // open, because it is evictable and an open descriptor would keep the
+        // bytes on disk after the cache had given them up. What that costs is
+        // that a caller who did not pin the part gets an `io::Error` here,
+        // whose own message says only "No such file or directory" -- which
+        // once reached a client as a 500 with nothing to chase. So every
+        // failure names the operation, the part, the path and the kind.
+        let path = self.part.data_path();
+        let failed = |what: &str, error: std::io::Error| {
+            format!(
+                "metric part {} chunk read: {what} {} at offset {} for {} bytes: {error} ({:?})",
+                self.part.meta.id,
+                path.display(),
+                location.offset,
+                location.length,
+                error.kind(),
+            )
+        };
+        let mut file = fs::File::open(&path).map_err(|error| failed("open", error))?;
         file.seek(SeekFrom::Start(location.offset))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| failed("seek", error))?;
         let mut chunk = vec![0u8; location.length as usize];
         file.read_exact(&mut chunk)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| failed("read", error))?;
         Ok(chunk)
     }
 

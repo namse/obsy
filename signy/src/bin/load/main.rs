@@ -2128,6 +2128,15 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         }
         json!({
             "enabled": true,
+            "empty_answers_at": metric_query
+                .empty_at
+                .iter()
+                .map(|(shape, at, catching_up)| json!({
+                    "shape": shape,
+                    "at_seconds": (at * 10.0).round() / 10.0,
+                    "catching_up": catching_up,
+                }))
+                .collect::<Vec<_>>(),
             "tenant": corpus.tenant_ids.first().map(|id| id.as_str()),
             "scrape_interval_seconds": cfg.metric_leg_scrape_seconds,
             "churn_per_scrape": cfg.metric_leg_churn_per_scrape,

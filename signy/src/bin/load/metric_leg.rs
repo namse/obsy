@@ -229,6 +229,14 @@ pub struct MetricQueryOutcome {
     pub shape_empty_recovering: BTreeMap<&'static str, u64>,
     /// Shapes waiting to see rows again after an unanswered read.
     pub recovering: std::collections::BTreeSet<&'static str>,
+    /// When each empty answer happened, in seconds since the leg started, and
+    /// whether the shape was catching up at the time.
+    ///
+    /// A count alone cannot be argued with: it says a shape went quiet and not
+    /// whether that was a minute the collector had not delivered yet. Bounded
+    /// so a leg that goes quiet for an hour does not turn into a list of every
+    /// second of it.
+    pub empty_at: Vec<(&'static str, f64, bool)>,
     pub answered: u64,
     pub errors: u64,
     pub throttled: u64,
@@ -255,6 +263,8 @@ pub async fn metric_query_leg(
     warmup_end: Instant,
 ) -> MetricQueryOutcome {
     let mut outcome = MetricQueryOutcome::default();
+    // The leg's own clock, so an empty answer can be put beside the fault log.
+    let leg_start = Instant::now();
     if cfg.target != Target::Signy {
         return outcome;
     }
@@ -316,7 +326,15 @@ pub async fn metric_query_leg(
                             *outcome.shape_judged.entry(shape.name()).or_default() += 1;
                             outcome.judged_total += 1;
                             if rows == 0 {
-                                if outcome.recovering.contains(shape.name()) {
+                                let catching_up = outcome.recovering.contains(shape.name());
+                                if outcome.empty_at.len() < 512 {
+                                    outcome.empty_at.push((
+                                        shape.name(),
+                                        leg_start.elapsed().as_secs_f64(),
+                                        catching_up,
+                                    ));
+                                }
+                                if catching_up {
                                     *outcome
                                         .shape_empty_recovering
                                         .entry(shape.name())

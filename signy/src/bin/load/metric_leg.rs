@@ -215,6 +215,20 @@ pub struct MetricQueryOutcome {
     /// a read path that quietly stops finding what was written answers
     /// exactly this way, and a status-code gate would call it a pass.
     pub shape_empty: BTreeMap<&'static str, u64>,
+    /// Empty answers a shape gave while it was still catching up from a
+    /// window where nobody answered at all.
+    ///
+    /// An instant query asks about the last minute by definition, and the
+    /// collector in front of the engine holds an outage's exports until it has
+    /// drained them in order. So the minute after the engine returns is a
+    /// minute the engine legitimately has nothing for, and counting it as "the
+    /// read path stopped finding what was written" says the opposite of what
+    /// happened. A shape enters this state when a read goes unanswered and
+    /// leaves it the moment that same shape returns rows again -- so a leg that
+    /// never recovers still fails, and no window has to be guessed at.
+    pub shape_empty_recovering: BTreeMap<&'static str, u64>,
+    /// Shapes waiting to see rows again after an unanswered read.
+    pub recovering: std::collections::BTreeSet<&'static str>,
     pub answered: u64,
     pub errors: u64,
     pub throttled: u64,
@@ -302,7 +316,16 @@ pub async fn metric_query_leg(
                             *outcome.shape_judged.entry(shape.name()).or_default() += 1;
                             outcome.judged_total += 1;
                             if rows == 0 {
-                                *outcome.shape_empty.entry(shape.name()).or_default() += 1;
+                                if outcome.recovering.contains(shape.name()) {
+                                    *outcome
+                                        .shape_empty_recovering
+                                        .entry(shape.name())
+                                        .or_default() += 1;
+                                } else {
+                                    *outcome.shape_empty.entry(shape.name()).or_default() += 1;
+                                }
+                            } else {
+                                outcome.recovering.remove(shape.name());
                             }
                             outcome.steady.record(queueing_ms, service_ms);
                             outcome
@@ -330,6 +353,9 @@ pub async fn metric_query_leg(
             Err(error) => {
                 outcome.unavailable += 1;
                 outcome.first_unavailable.get_or_insert(error);
+                for shape in METRIC_QUERY_SHAPES {
+                    outcome.recovering.insert(shape.name());
+                }
             }
         }
     }

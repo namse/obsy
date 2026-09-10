@@ -2067,6 +2067,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 .get(shape.name())
                 .copied()
                 .unwrap_or(0);
+            // Empties a shape gave while catching up from an unanswered
+            // window are not here: see `shape_empty_recovering`.
             let empty = metric_query
                 .shape_empty
                 .get(shape.name())
@@ -2114,6 +2116,11 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                     "judged": metric_query.shape_judged.get(name).copied().unwrap_or(0),
                     "series_returned": metric_query.shape_rows.get(name).copied().unwrap_or(0),
                     "empty_answers": metric_query.shape_empty.get(name).copied().unwrap_or(0),
+                    "empty_while_recovering": metric_query
+                        .shape_empty_recovering
+                        .get(name)
+                        .copied()
+                        .unwrap_or(0),
                     "must_return_rows": shape.must_return_rows(),
                     "latency_ms": latency.summary(),
                 }),

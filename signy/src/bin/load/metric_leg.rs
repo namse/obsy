@@ -139,9 +139,9 @@ pub async fn metric_ingest_leg(
                     outcome.tally.datapoints_offered += datapoints;
                     outcome.tally.series_offered += series;
                     outcome.tally.series_rejected += series;
-                    outcome.tally.errors += 1;
+                    outcome.tally.unavailable += 1;
                     outcome.tally.latency.push(elapsed_ms);
-                    outcome.tally.first_error.get_or_insert(error);
+                    outcome.tally.first_unavailable.get_or_insert(error);
                 }
             }
         }
@@ -218,8 +218,12 @@ pub struct MetricQueryOutcome {
     pub answered: u64,
     pub errors: u64,
     pub throttled: u64,
+    /// Reads nobody answered. A soak stops the engine on purpose, so this is
+    /// availability, not correctness, and it is counted apart from `errors`.
+    pub unavailable: u64,
     pub statuses: BTreeMap<u16, u64>,
     pub first_error: Option<String>,
+    pub first_unavailable: Option<String>,
     /// Answers issued past the settling floor, across every shape, and the
     /// floor itself. A run shorter than the floor judges nothing, and a report
     /// that said `pass` without saying that would be claiming a check it never
@@ -324,8 +328,8 @@ pub async fn metric_query_leg(
                 }
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome.first_error.get_or_insert(error);
+                outcome.unavailable += 1;
+                outcome.first_unavailable.get_or_insert(error);
             }
         }
     }

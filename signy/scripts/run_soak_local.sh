@@ -330,6 +330,22 @@ start_collecty() {
 
 touch "$OUT/RUNNING"
 start_signy || exit 1
+# The collector's tenant, onboarded before the collector exists.
+#
+# collecty exports its own metrics the moment it is up, and the harness that
+# pushes tenant policies does not start until after it. That left a window of
+# about a second and a half in which signy was serving no tenant by that name
+# and refused the export, exactly as it is specified to -- one dropped resource
+# per run, at +1.6 s, in every soak ever taken. The drop was the running order,
+# not the engine, and the fix is to put the policy in first. The harness pushes
+# it again for every tenant when it starts; the endpoint is idempotent.
+if [ "$COLLECTY" != "off" ]; then
+  curl -fsS --max-time 10 -X PUT \
+    -H 'Content-Type: application/json' \
+    -d "{\"retention\": \"$TENANT_RETENTION\"}" \
+    "http://127.0.0.1:$PORT/signy/api/v1/admin/tenants/$COLLECTY_TENANT/retention" \
+    >/dev/null || echo "warning: could not onboard $COLLECTY_TENANT before collecty"
+fi
 start_collecty || exit 1
 
 # Read from the server's own process rather than derived from this shell's:

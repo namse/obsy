@@ -79,6 +79,12 @@ struct PushOutcome {
     accepted: u64,
     throttled: u64,
     errors: u64,
+    /// Reads nobody answered: the address refused, or the connection went
+    /// while the request was out. A soak stops the engine on purpose, so this
+    /// is a statement about availability and not about correctness, and
+    /// mixing it into `errors` is what made a fault schedule look like a
+    /// defect.
+    unavailable: u64,
     events_accepted: u64,
     events_offered: u64,
     wire_bytes: u64,
@@ -90,6 +96,7 @@ struct PushOutcome {
     connects: u64,
     statuses: BTreeMap<u16, u64>,
     first_error: Option<String>,
+    first_unavailable: Option<String>,
 }
 
 impl PushOutcome {
@@ -100,6 +107,7 @@ impl PushOutcome {
         self.accepted += other.accepted;
         self.throttled += other.throttled;
         self.errors += other.errors;
+        self.unavailable += other.unavailable;
         self.events_accepted += other.events_accepted;
         self.events_offered += other.events_offered;
         self.wire_bytes += other.wire_bytes;
@@ -113,6 +121,7 @@ impl PushOutcome {
             *self.statuses.entry(status).or_default() += count;
         }
         self.first_error = self.first_error.take().or(other.first_error);
+        self.first_unavailable = self.first_unavailable.take().or(other.first_unavailable);
     }
 }
 
@@ -124,6 +133,12 @@ struct QueryOutcome {
     answered: u64,
     errors: u64,
     throttled: u64,
+    /// Reads nobody answered: the address refused, or the connection went
+    /// while the request was out. A soak stops the engine on purpose, so this
+    /// is a statement about availability and not about correctness, and
+    /// mixing it into `errors` is what made a fault schedule look like a
+    /// defect.
+    unavailable: u64,
     restore_probes: u64,
     restore_rows: u64,
     restore_probes_with_rows: u64,
@@ -131,6 +146,7 @@ struct QueryOutcome {
     connects: u64,
     statuses: BTreeMap<u16, u64>,
     first_error: Option<String>,
+    first_unavailable: Option<String>,
 }
 
 impl QueryOutcome {
@@ -145,6 +161,7 @@ impl QueryOutcome {
         self.answered += other.answered;
         self.errors += other.errors;
         self.throttled += other.throttled;
+        self.unavailable += other.unavailable;
         self.restore_probes += other.restore_probes;
         self.restore_rows += other.restore_rows;
         self.restore_probes_with_rows += other.restore_probes_with_rows;
@@ -154,6 +171,53 @@ impl QueryOutcome {
             *self.statuses.entry(status).or_default() += count;
         }
         self.first_error = self.first_error.take().or(other.first_error);
+    }
+}
+
+/// Counters the engine resets when it restarts, banked across the restarts a
+/// soak causes on purpose.
+///
+/// A soak reads `dropped_by_reason` from one scrape at the end, which is only
+/// ever the last generation's tally: a day with five restarts reported the
+/// drops of its final stretch and called it the run's. The sampler already
+/// scrapes `/metrics` on its own interval, so the whole-run figure costs
+/// nothing but noticing when a value goes backwards -- which a monotonic
+/// counter only does by starting again.
+#[derive(Default)]
+struct RestartSafeBreakdown {
+    /// label -> value seen in the generation running now.
+    current: BTreeMap<String, u64>,
+    /// label -> everything earlier generations had counted before they went.
+    banked: BTreeMap<String, u64>,
+    restarts_seen: u64,
+}
+
+impl RestartSafeBreakdown {
+    fn observe(&mut self, seen: BTreeMap<String, u64>) {
+        // One counter going backwards means the process behind all of them
+        // did, so the whole tally is banked rather than the single label.
+        let restarted = seen
+            .iter()
+            .any(|(label, value)| *value < self.current.get(label).copied().unwrap_or(0))
+            || (!self.current.is_empty()
+                && seen.is_empty());
+        if restarted {
+            for (label, value) in std::mem::take(&mut self.current) {
+                *self.banked.entry(label).or_default() += value;
+            }
+            self.restarts_seen += 1;
+        }
+        for (label, value) in seen {
+            self.current.insert(label, value);
+        }
+    }
+
+    fn total(&self) -> BTreeMap<String, u64> {
+        let mut out = self.banked.clone();
+        for (label, value) in &self.current {
+            *out.entry(label.clone()).or_default() += *value;
+        }
+        out
     }
 }
 
@@ -176,6 +240,9 @@ struct SampleOutcome {
     series_flushing_tenants: GaugeSeries,
     rss: GaugeSeries,
     anon: GaugeSeries,
+    /// The ingest drop tally, summed over every generation of the engine this
+    /// run went through rather than read off the last one.
+    dropped_resources: RestartSafeBreakdown,
     health_samples: u64,
     health_healthy: u64,
     scrape_errors: u64,
@@ -194,20 +261,40 @@ struct OtlpOutcome {
     connected: bool,
     /// Traces read back by id after they were sent, and what came of it.
     ///
-    /// `missing` is a trace the timeline route answered 404 for; `short` is one
-    /// it answered with fewer spans than were exported. Both are wrong answers
-    /// rather than slow ones, so both fail the run.
+    /// The three ways a readback can end badly are three different statements
+    /// and are counted apart, because only one of them is the engine being
+    /// wrong:
+    ///
+    /// * `missing` — the timeline route answered 404 after the readback had
+    ///   spent its whole patience. The trace was acked and is not there.
+    /// * `short` — it answered with fewer spans than were exported.
+    /// * `quota_rejected` — it answered 429. That is the tenant's own
+    ///   concurrency limit doing what it is for, not a lost trace, and it used
+    ///   to be counted as one.
+    /// * `unexpected_status` — anything else. Kept apart from `missing` so a
+    ///   new failure mode cannot hide inside a number that means data loss.
+    ///
+    /// `missing`, `short` and `unexpected_status` fail the run. The other two
+    /// do not.
     verify_attempts: u64,
     verified: u64,
     missing: u64,
     short: u64,
+    quota_rejected: u64,
+    unexpected_status: u64,
     /// Probes that could not be made: the read address did not answer at all.
     /// Not a wrong answer — a soak takes the engine down on purpose — so it is
     /// counted and reported rather than failed.
     unreachable: u64,
-    /// Traces asked for again after a 404, because a backlog can put one behind
-    /// the probe's lag.
+    /// Traces asked for again, because a backlog in front of the engine is not
+    /// the engine losing a trace. A soak's outage plus the collector's drain
+    /// behind it outlasts a single retry, which is why the budget is a number
+    /// rather than "once".
     retried: u64,
+    /// Traces the readback gave up on with its patience spent, still counted
+    /// in `missing`. Reported so a run can say whether the budget was the
+    /// binding constraint.
+    gave_up_after_budget: u64,
     /// Set when the run was long enough for a sent trace to come back. A run
     /// that stopped before the first probe was due proves nothing about the
     /// read path, and must not read as if it had.
@@ -1153,8 +1240,8 @@ async fn push_worker(
                 }
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome.first_error.get_or_insert(error);
+                outcome.unavailable += 1;
+                outcome.first_unavailable.get_or_insert(error);
             }
         }
     }
@@ -1266,8 +1353,8 @@ async fn query_worker(
                 }
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome.first_error.get_or_insert(error);
+                outcome.unavailable += 1;
+                outcome.first_unavailable.get_or_insert(error);
             }
         }
     }
@@ -1308,6 +1395,11 @@ async fn sampler(cfg: Config, stop: Arc<AtomicBool>, run_start: Instant) -> Samp
         match scrape(&mut client).await {
             Some(metrics) => match cfg.target {
                 Target::Signy => {
+                    outcome.dropped_resources.observe(probe::breakdown(
+                        &metrics,
+                        "signy_ingest_dropped_resources_total",
+                        "reason",
+                    ));
                     outcome
                         .wal_backlog
                         .push(elapsed, probe::gauge(&metrics, "signy_wal_backlog_bytes"));
@@ -1464,7 +1556,14 @@ async fn otlp_workload(
             && at.elapsed() >= lag
         {
             let (_, mut trace) = pending.pop_front().expect("the front was just read");
-            if verify_trace(&mut reader, &read_tenant, &trace, &mut outcome).await
+            if verify_trace(
+                &mut reader,
+                &read_tenant,
+                &trace,
+                cfg.trace_verify_max_attempts,
+                &mut outcome,
+            )
+            .await
                 == TraceProbe::AskAgain
             {
                 outcome.retried += 1;
@@ -1515,6 +1614,7 @@ async fn verify_trace(
     reader: &mut Client,
     read_tenant: &(&'static str, String),
     trace: &SentTrace,
+    max_attempts: u32,
     outcome: &mut OtlpOutcome,
 ) -> TraceProbe {
     outcome.verify_attempts += 1;
@@ -1549,16 +1649,34 @@ async fn verify_trace(
             }
             TraceProbe::Done
         }
-        Ok(response) if response.status == 404 && trace.attempts == 0 => TraceProbe::AskAgain,
+        // The tenant's read concurrency limit. The engine is up and answering;
+        // it is saying this tenant already has as many queries in flight as it
+        // is sold. Retried like a backlog, never counted as a lost trace.
+        Ok(response) if response.status == 429 => {
+            outcome.quota_rejected += 1;
+            if trace.attempts < max_attempts {
+                TraceProbe::AskAgain
+            } else {
+                TraceProbe::Done
+            }
+        }
+        Ok(response) if response.status == 404 && trace.attempts < max_attempts => {
+            TraceProbe::AskAgain
+        }
         Ok(response) if response.status == 404 => {
             outcome.missing += 1;
-            outcome
-                .first_verify_error
-                .get_or_insert_with(|| format!("trace {} was not found twice", trace.id));
+            outcome.gave_up_after_budget += 1;
+            outcome.first_verify_error.get_or_insert_with(|| {
+                format!(
+                    "trace {} was not found in {} attempts",
+                    trace.id,
+                    trace.attempts + 1
+                )
+            });
             TraceProbe::Done
         }
         Ok(response) => {
-            outcome.missing += 1;
+            outcome.unexpected_status += 1;
             outcome.first_verify_error.get_or_insert_with(|| {
                 format!("the timeline route answered {}", response.status)
             });
@@ -1566,8 +1684,8 @@ async fn verify_trace(
         }
         // The read address did not answer. A soak stops the engine on purpose,
         // so this says nothing about whether the trace is stored, and asking
-        // again once is the only honest thing to do with it.
-        Err(_) if trace.attempts == 0 => {
+        // again is the only honest thing to do with it.
+        Err(_) if trace.attempts < max_attempts => {
             outcome.unreachable += 1;
             TraceProbe::AskAgain
         }
@@ -1863,8 +1981,13 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
     // check the trace path has ever had: every earlier run wrote spans and
     // asked nothing about them afterwards. A run too short for a probe to come
     // due proves nothing either way, and says so rather than passing.
+    // A quota refusal is not a lost trace and an outage is not one either, so
+    // neither is here. What is here is the engine answering wrongly: a trace it
+    // acked and cannot produce, one it produces short, or a status nobody
+    // planned for.
     let traces_pass = otlp.missing == 0
         && otlp.short == 0
+        && otlp.unexpected_status == 0
         && (!otlp.verification_expected || otlp.verified > 0);
     // Every OTLP export this run got a 2xx for, across the three signals.
     //
@@ -1963,6 +2086,10 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         elapsed_seconds > metric_query.settling_seconds as f64 && metric_query.answered > 0;
     let metric_reads_judged =
         !metric_reads_on || !metric_outlasted_settling || metric_query.judged_total > 0;
+    // Unanswered reads are not here: a soak takes the engine down on purpose,
+    // and the availability those windows cost is reported beside this rather
+    // than folded into it. What is here is the engine answering wrongly while
+    // it was up.
     let metric_leg_pass = !metric_leg_on
         || (metric_ingest_delivered
             && metric_ingest.tally.errors == 0
@@ -2026,6 +2153,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 },
                 "errors": metric_query.errors,
                 "throttled": metric_query.throttled,
+                "unavailable": metric_query.unavailable,
+                "first_unavailable": metric_query.first_unavailable,
                 "first_error": metric_query.first_error.clone(),
                 "statuses": metric_query.statuses.iter()
                     .map(|(status, count)| (status.to_string(), *count))
@@ -2137,11 +2266,11 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
                 "delivered": signy_delivered,
                 "events_accepted": push.events_accepted,
                 "dropped_resources": dropped_resources,
-                "dropped_by_reason": probe::breakdown(
-                    &end_metrics,
-                    "signy_ingest_dropped_resources_total",
-                    "reason",
-                ),
+                // Summed over every generation of the engine, not read off
+                // the last one: a soak restarts the process on purpose and the
+                // counter starts again each time.
+                "dropped_by_reason": samples.dropped_resources.total(),
+                "dropped_generations_observed": samples.dropped_resources.restarts_seen + 1,
                 "no_ingest_errors": ingest_errors == 0,
                 "remote_healthy_fraction": remote_healthy_fraction,
                 "cache_healthy_end": cache_healthy_end,
@@ -2317,6 +2446,8 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "answered": query.answered,
             "errors": query.errors,
             "throttled": query.throttled,
+            "unavailable": query.unavailable,
+            "first_unavailable": query.first_unavailable,
             "rows_returned": query.rows_returned,
             "restore_probes": query.restore_probes,
             "achieved_qps": query.answered as f64 / elapsed_seconds,
@@ -2437,9 +2568,13 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "attempts": otlp.verify_attempts,
             "verified": otlp.verified,
             "missing": otlp.missing,
+            "gave_up_after_budget": otlp.gave_up_after_budget,
             "short": otlp.short,
+            "unexpected_status": otlp.unexpected_status,
+            "quota_rejected": otlp.quota_rejected,
             "unreachable": otlp.unreachable,
             "retried": otlp.retried,
+            "max_attempts": cfg.trace_verify_max_attempts,
             "search_probes": otlp.search_probes,
             "search_empty": otlp.search_empty,
             "first_error": otlp.first_verify_error,

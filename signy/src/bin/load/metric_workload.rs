@@ -1214,7 +1214,12 @@ pub struct PhaseTally {
     pub series_accepted: u64,
     pub series_rejected: u64,
     pub errors: u64,
+    /// Scrapes nobody answered. A soak stops the engine on purpose, so an
+    /// unanswered push is availability rather than an ingest error, and the
+    /// two are counted apart.
+    pub unavailable: u64,
     pub first_error: Option<String>,
+    pub first_unavailable: Option<String>,
     pub statuses: BTreeMap<u16, u64>,
     pub latency: crate::stats::Series,
 }

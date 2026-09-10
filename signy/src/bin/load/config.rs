@@ -388,6 +388,15 @@ pub struct Config {
     /// journal — because a probe that runs too early reports a miss the engine
     /// never made.
     pub trace_verify_lag_seconds: u64,
+    /// How many times a readback may ask before it calls a trace missing.
+    ///
+    /// One retry was not a budget, it was a coin toss: a soak's outage is
+    /// three minutes and the collector's drain behind it took another two and
+    /// a half, so a trace caught by one had two chances a lag apart against a
+    /// disturbance five times that long, and the ones that lost were counted
+    /// as data loss. Five attempts at the default lag outlast the disturbance;
+    /// a trace that is still absent after that is absent.
+    pub trace_verify_max_attempts: u32,
     /// One trace in this many is kept for the read-back probe. Every one would
     /// double the leg's traffic and turn a garnish into a second query
     /// workload.
@@ -580,6 +589,7 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             drain_seconds: env_u64("SIGNY_LOAD_DRAIN_SECONDS", 180),
             trace_verify_lag_seconds: env_u64("SIGNY_LOAD_TRACE_VERIFY_LAG_SECONDS", 60),
+            trace_verify_max_attempts: env_u64("SIGNY_LOAD_TRACE_VERIFY_MAX_ATTEMPTS", 5) as u32,
             trace_verify_sample: env_u64("SIGNY_LOAD_TRACE_VERIFY_SAMPLE", 10).max(1),
             tier: env_string("SIGNY_LOAD_TIER", "B"),
             seed: env_u64("SIGNY_LOAD_SEED", 0x5eed_2026),

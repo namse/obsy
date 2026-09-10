@@ -229,6 +229,9 @@ pub struct MetricQueryOutcome {
     pub shape_empty_recovering: BTreeMap<&'static str, u64>,
     /// Shapes waiting to see rows again after an unanswered read.
     pub recovering: std::collections::BTreeSet<&'static str>,
+    /// How long a leg is allowed to be catching up after a read nobody
+    /// answered, reported so the number the judging used is in the artifact.
+    pub recovery_grace_seconds: u64,
     /// When each empty answer happened, in seconds since the leg started, and
     /// whether the shape was catching up at the time.
     ///
@@ -265,6 +268,20 @@ pub async fn metric_query_leg(
     let mut outcome = MetricQueryOutcome::default();
     // The leg's own clock, so an empty answer can be put beside the fault log.
     let leg_start = Instant::now();
+    // When a read last went unanswered, and how long after that the leg is
+    // still allowed to be catching up.
+    //
+    // A single non-empty answer is not proof the pipeline has caught up: the
+    // collector drains an outage's exports in order, and an instant query
+    // asking about the last minute can find rows once and a gap again a
+    // moment later. Measured over three faulted runs, every empty answer fell
+    // in a burst starting within two seconds of the engine returning and
+    // lasting 50 to 111 seconds, against outages of 57 to 208; the 24-hour
+    // soak's collector took 157 to 184 seconds to drain a 180-second outage.
+    // The grace is set above all of those rather than at them.
+    let recovery_grace = std::time::Duration::from_secs(cfg.metric_recovery_grace_seconds);
+    outcome.recovery_grace_seconds = cfg.metric_recovery_grace_seconds;
+    let mut last_unavailable: Option<Instant> = None;
     if cfg.target != Target::Signy {
         return outcome;
     }
@@ -326,7 +343,9 @@ pub async fn metric_query_leg(
                             *outcome.shape_judged.entry(shape.name()).or_default() += 1;
                             outcome.judged_total += 1;
                             if rows == 0 {
-                                let catching_up = outcome.recovering.contains(shape.name());
+                                let catching_up = outcome.recovering.contains(shape.name())
+                                    || last_unavailable
+                                        .is_some_and(|at| at.elapsed() < recovery_grace);
                                 if outcome.empty_at.len() < 512 {
                                     outcome.empty_at.push((
                                         shape.name(),
@@ -371,6 +390,7 @@ pub async fn metric_query_leg(
             Err(error) => {
                 outcome.unavailable += 1;
                 outcome.first_unavailable.get_or_insert(error);
+                last_unavailable = Some(Instant::now());
                 for shape in METRIC_QUERY_SHAPES {
                     outcome.recovering.insert(shape.name());
                 }

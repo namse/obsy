@@ -2128,6 +2128,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
         }
         json!({
             "enabled": true,
+            "recovery_grace_seconds": metric_query.recovery_grace_seconds,
             "empty_answers_at": metric_query
                 .empty_at
                 .iter()

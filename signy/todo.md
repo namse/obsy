@@ -1235,6 +1235,16 @@ The polish order, each item a measurement or a bound, none a feature:
    is backpressure working, and the push p95 target is missed in the same breath — and
    `part_meta` is the one remaining GROWING row, 8.1 → 13.0 MiB over the day, which is
    `PartMeta::streams` (polish item 2's residue) presenting its bill in slow motion.
+
+   **And again on the production build, with faults, on 2026-09-08: PASS**
+   (docs/SOAK_24H.md). Engine `c0247b0`, mimalloc, 2 GiB / 20 k eps / 24 h,
+   retention 30 m, collecty and traces and metrics all on, seven fault windows
+   all recovered. Anon quarter-means 1001.7 / 1005.2 / 965.5 / 993.8 MiB, peak
+   1708.3, no OOM. That document also carries what the run cost to read
+   correctly: the rig's own disk had to be trimmed hourly before its latency
+   meant anything, one metric read defect it found and the fix, and two
+   readings that looked like defects and were the harness counting an arranged
+   outage as one.
 2. **The unbounded residents** — sidecar + `PartMeta::streams` grow with part count and nothing
    evicts them (~380 KB/part measured; VISION already scopes the fix: sidecars are durable in
    `index.bin`, so eviction is a re-read; stream identity can be a fingerprint). The in-flight push

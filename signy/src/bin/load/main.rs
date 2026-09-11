@@ -295,6 +295,14 @@ struct OtlpOutcome {
     /// in `missing`. Reported so a run can say whether the budget was the
     /// binding constraint.
     gave_up_after_budget: u64,
+    /// When each trace was called missing, in seconds since the leg started.
+    ///
+    /// A count says the engine could not produce a trace it acked and nothing
+    /// about whether that was a minute the collector had not delivered yet.
+    /// Put beside the run's own fault log it says which. Bounded, because a
+    /// read path that has stopped answering should not become a list of every
+    /// trace it did not answer for.
+    missing_at: Vec<f64>,
     /// Set when the run was long enough for a sent trace to come back. A run
     /// that stopped before the first probe was due proves nothing about the
     /// read path, and must not read as if it had.
@@ -1521,6 +1529,8 @@ async fn otlp_workload(
     let mut rng = signy::corpus::Rng::new(cfg.seed ^ OTLP_SEED_SALT);
     let read_tenant = Target::Signy.read_tenant_header(&tenant);
     let lag = Duration::from_secs(cfg.trace_verify_lag_seconds);
+    // The leg's own clock, so a missing trace can be put beside the fault log.
+    let leg_start = Instant::now();
     outcome.verification_expected = deadline.saturating_duration_since(Instant::now()) > lag * 2;
     // Traces waiting out their lag before being read back. Bounded because a
     // read path that stopped answering must not turn into unbounded memory in
@@ -1561,6 +1571,7 @@ async fn otlp_workload(
                 &read_tenant,
                 &trace,
                 cfg.trace_verify_max_attempts,
+                leg_start.elapsed().as_secs_f64(),
                 &mut outcome,
             )
             .await
@@ -1615,6 +1626,7 @@ async fn verify_trace(
     read_tenant: &(&'static str, String),
     trace: &SentTrace,
     max_attempts: u32,
+    at_seconds: f64,
     outcome: &mut OtlpOutcome,
 ) -> TraceProbe {
     outcome.verify_attempts += 1;
@@ -1666,6 +1678,9 @@ async fn verify_trace(
         Ok(response) if response.status == 404 => {
             outcome.missing += 1;
             outcome.gave_up_after_budget += 1;
+            if outcome.missing_at.len() < 512 {
+                outcome.missing_at.push((at_seconds * 10.0).round() / 10.0);
+            }
             outcome.first_verify_error.get_or_insert_with(|| {
                 format!(
                     "trace {} was not found in {} attempts",
@@ -2586,6 +2601,7 @@ fn build_report(inputs: ReportInputs<'_>) -> Value {
             "verified": otlp.verified,
             "missing": otlp.missing,
             "gave_up_after_budget": otlp.gave_up_after_budget,
+            "missing_at_seconds": otlp.missing_at,
             "short": otlp.short,
             "unexpected_status": otlp.unexpected_status,
             "quota_rejected": otlp.quota_rejected,

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -27,6 +27,18 @@ pub struct Observation {
     pub refused_segments: u64,
     pub refused_bytes: u64,
     pub retries: u64,
+    pub host_metrics_exports: u64,
+    pub host_metrics_errors: u64,
+    pub journal_exports: u64,
+    pub journal_errors: u64,
+}
+
+#[derive(Default)]
+pub struct SourceStats {
+    pub host_metrics_exports: AtomicU64,
+    pub host_metrics_errors: AtomicU64,
+    pub journal_exports: AtomicU64,
+    pub journal_errors: AtomicU64,
 }
 
 enum Kind {
@@ -113,6 +125,30 @@ const FAMILIES: &[Family] = &[
         kind: Kind::Counter,
         read: |observation| observation.retries,
     },
+    Family {
+        name: "collecty_host_metrics_exports_total",
+        unit: "{export}",
+        kind: Kind::Counter,
+        read: |observation| observation.host_metrics_exports,
+    },
+    Family {
+        name: "collecty_host_metrics_errors_total",
+        unit: "{error}",
+        kind: Kind::Counter,
+        read: |observation| observation.host_metrics_errors,
+    },
+    Family {
+        name: "collecty_journal_exports_total",
+        unit: "{export}",
+        kind: Kind::Counter,
+        read: |observation| observation.journal_exports,
+    },
+    Family {
+        name: "collecty_journal_errors_total",
+        unit: "{error}",
+        kind: Kind::Counter,
+        read: |observation| observation.journal_errors,
+    },
 ];
 
 pub struct Reporter {
@@ -121,6 +157,7 @@ pub struct Reporter {
     spool: Spool,
     started_unix_nanos: u64,
     tenant: Option<String>,
+    source_stats: Arc<SourceStats>,
 }
 
 impl Reporter {
@@ -129,6 +166,7 @@ impl Reporter {
         stats: Arc<SenderStats>,
         spool: Spool,
         tenant: Option<String>,
+        source_stats: Arc<SourceStats>,
     ) -> Reporter {
         Reporter {
             queue,
@@ -136,6 +174,7 @@ impl Reporter {
             spool,
             started_unix_nanos: unix_nanos(),
             tenant,
+            source_stats,
         }
     }
 
@@ -153,6 +192,16 @@ impl Reporter {
             refused_segments: self.stats.refused_segments.load(Ordering::Relaxed),
             refused_bytes: self.stats.refused_bytes.load(Ordering::Relaxed),
             retries: self.stats.retries.load(Ordering::Relaxed),
+            host_metrics_exports: self
+                .source_stats
+                .host_metrics_exports
+                .load(Ordering::Relaxed),
+            host_metrics_errors: self
+                .source_stats
+                .host_metrics_errors
+                .load(Ordering::Relaxed),
+            journal_exports: self.source_stats.journal_exports.load(Ordering::Relaxed),
+            journal_errors: self.source_stats.journal_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -351,7 +400,13 @@ mod tests {
             .expect("a queue"),
         );
         let spool = Spool::new(queue.clone());
-        let reporter = Reporter::new(queue, Arc::new(SenderStats::default()), spool, None);
+        let reporter = Reporter::new(
+            queue,
+            Arc::new(SenderStats::default()),
+            spool,
+            None,
+            Arc::new(SourceStats::default()),
+        );
         assert!(reporter.export(&reporter.observe()).is_none());
     }
 

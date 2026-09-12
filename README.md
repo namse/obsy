@@ -87,5 +87,10 @@ decision was made, and
 [`CONFIGURATION.md`](collecty/docs/CONFIGURATION.md) for every knob and what
 raising it costs.
 
+collecty can optionally collect a bounded set of Linux host metrics and the
+systemd journal in a per-machine deployment. Those sources are disabled by
+default and feed the same OTLP disk queue as network exports; collecty does not
+become a general-purpose pipeline engine.
+
 collecty carries no comments in its source. Every "why" that would have been one
 is in `docs/ARCHITECTURE.md` instead.

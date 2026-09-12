@@ -13,6 +13,7 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Item | Decision |
 |---|---|
 | Deployment | One process per machine or one sidecar per pod; both are supported and neither is assumed |
+| Built-in sources | Optional Linux host metrics and systemd journal inputs; disabled by default |
 | Ingest protocol | **OTLP/HTTP**, protobuf and uncompressed, all three signals. `POST /v1/logs`, `/v1/traces`, `/v1/metrics` on a TCP port, 4318 by default |
 | Payload handling | **Never decoded.** The bytes that arrive are the bytes that are stored and the bytes that are sent |
 | Acknowledgement | After the record enters the open segment's compressor, before it is on the device. See "What an acknowledgement means" |
@@ -23,8 +24,8 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals, each request naming its own |
 | Sender identity | Random 16 bytes made with the queue directory, in a file of their own. Not configurable, and not the hostname — it names the queue, not the machine |
 | What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
-| Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Its own metrics are the exception — see below |
-| Self-observation | `collecty_*` metrics encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. This is the one export collecty builds itself, so it is the one place it names a tenant: `COLLECTY_TENANT`, and unset means the export is not built |
+| Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Collecty-generated metrics and enabled host-source telemetry use `COLLECTY_TENANT` — see below |
+| Self-observation | `collecty_*` metrics and enabled host-source telemetry are encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. `COLLECTY_TENANT` names every export collecty builds; unset means none of those exports are built |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
 | Transport security | **None, by design.** No TLS and no authentication on either hop, so **the bind address is the access control**: the default is loopback, and anything wider is expected to stay inside a trust boundary |
 
@@ -105,7 +106,7 @@ into the queue. An empty body is a valid `ExportLogsServiceResponse` with no
 costs zero bytes and zero encoding work.
 
 Because of this, `prost` and `opentelemetry-proto` are **not** on the receive
-path at all. They appear at runtime only to *encode* collecty's own metrics
+path at all. They appear at runtime only to *encode* collecty-generated telemetry
 (see "Self-observation"), and in tests to prove the concatenation property.
 
 Two things are refused rather than stored, both because the queue's whole
@@ -132,7 +133,7 @@ Two ceilings guard memory:
 - **Per request.** A declared `Content-Length` over the ceiling is refused with
   `413` *before* a byte of the body is read; a request that declares nothing is
   cut off at the ceiling while reading. `Intake::accept` keeps the same check
-  for callers that do not arrive over HTTP — collecty queues its own metrics
+  for callers that do not arrive over HTTP — collecty queues its generated telemetry
   through it.
 - **In flight.** A `Semaphore` whose permits are bytes. Each request acquires its
   own length and holds it until the record is on disk, so the memory a burst can
@@ -312,6 +313,46 @@ delivered segment is unlinked as it is answered for, so everything on disk is
 still owed. The separate backlog gauge went with the byte cursor that made the
 two differ.
 
+## Built-in host sources
+
+The network receiver remains a byte-transparent OTLP relay. Built-in sources are
+the only data collecty constructs itself, and they are opt-in so a sidecar does
+not request host access by accident. A source encodes an OTLP export and submits
+it through the same `Intake` and per-signal queue as an application export. It
+never sends directly to signy or keeps a second delivery queue.
+
+Host metrics are Linux-only and read a bounded set of procfs and rootfs files:
+CPU time, memory and swap, load, filesystem usage, disk I/O and network I/O.
+`COLLECTY_HOST_METRICS_ROOT` prefixes those paths for a container with the host
+filesystem mounted read-only. Cumulative values retain the host boot time as
+their OTLP start time; gauges use the collection timestamp only.
+
+The journal source follows `journalctl --output=json --follow` and maps the
+timestamp, `MESSAGE`, `PRIORITY`, selected systemd fields, host identity and
+`tenant.id` into OTLP log records. Unit and minimum-priority filters are source
+configuration, not a general transform language. The journal reader is an
+adapter so its process or library dependency can be chosen without changing
+the queue contract.
+
+Journal cursor state is tied to the queue identity. A cursor is persisted only
+after the batch has been appended, every affected open segment has been closed
+and `fsync`ed, and the cursor file has itself been atomically replaced and
+synced. A crash before the cursor sync replays entries; it may duplicate them,
+but it cannot advance the cursor beyond durable queued data. Queue overflow
+still drops whole segments and is reported as explicit data loss.
+
+`COLLECTY_TENANT` is required whenever a built-in source is enabled. The
+source-generated resource always carries that tenant, `service.name=collecty`
+and the stable host identity. If a required host path, journal reader or
+permission is unavailable, startup or the source health log reports the
+failure rather than silently running without that source.
+
+Source health stays bounded and low-cardinality: the self-observation export
+includes cumulative `collecty_host_metrics_exports_total`,
+`collecty_host_metrics_errors_total`, `collecty_journal_exports_total` and
+`collecty_journal_errors_total` families. The same failures are summarized on
+stderr; no unit, cursor or journal field is used as a metric label.
+
 ## Sending
 
 One sender task, one closed segment in flight at a time, oldest first across the
@@ -424,11 +465,12 @@ neither of which the old search was really for.
 
 ## Self-observation
 
-collecty encodes its own counters as an OTLP metrics export and pushes them
-through its own queue, so they take the same path as everything else and need no
-listening port. `opentelemetry-proto` is used rather than hand-written prost
-structs on purpose: a hand-transcribed field number fails silently, because the
-test that round-trips it decodes with the same wrong definition.
+collecty encodes its own counters and enabled host-source telemetry as OTLP
+exports and pushes them through its own queue, so they take the same path as
+everything else and need no listening port. `opentelemetry-proto` is used rather
+than hand-written prost structs on purpose: a hand-transcribed field number
+fails silently, because the test that round-trips it decodes with the same wrong
+definition.
 
 The cost is that while signy is unreachable, the metrics describing that outage
 are stuck in the queue behind it. The periodic summary written to stderr exists

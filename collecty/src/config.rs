@@ -19,15 +19,23 @@ pub struct Config {
     pub report_interval: Duration,
     pub zstd_level: i32,
     pub log_json: bool,
-    /// Which tenant collecty's *own* metrics belong to.
+    pub host_metrics_interval: Option<Duration>,
+    pub host_metrics_root: PathBuf,
+    pub journal: Option<JournalConfig>,
+    /// Which tenant collecty-generated telemetry belongs to.
     ///
-    /// The only tenant collecty has an opinion about. Everything it forwards
-    /// carries its own in the payload, which collecty never decodes; its
-    /// self-export it builds itself, so it is the one place a tenant has to be
-    /// named. Unset means it does not export them — signy would drop an export
-    /// naming no tenant, silently, and a queue kept busy producing dropped
-    /// bytes is worse than not producing them.
+    /// Everything collecty forwards carries its own tenant in the payload,
+    /// which collecty never decodes. Collecty-generated metrics and host
+    /// sources use this value. Unset disables generated exports.
     pub tenant: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct JournalConfig {
+    pub directory: Option<PathBuf>,
+    pub journalctl_path: PathBuf,
+    pub units: Vec<String>,
+    pub min_priority: u8,
 }
 
 impl Default for Config {
@@ -46,6 +54,9 @@ impl Default for Config {
             report_interval: Duration::from_secs(60),
             zstd_level: crate::wire::ZSTD_LEVEL,
             log_json: false,
+            host_metrics_interval: None,
+            host_metrics_root: PathBuf::from("/"),
+            journal: None,
             tenant: None,
         }
     }
@@ -82,6 +93,9 @@ impl Config {
                 string("COLLECTY_LOG_FORMAT", "text".to_string()).as_str(),
                 "json"
             ),
+            host_metrics_interval: optional_duration("COLLECTY_HOST_METRICS_INTERVAL")?,
+            host_metrics_root: path("COLLECTY_HOST_METRICS_ROOT", defaults.host_metrics_root),
+            journal: journal_config()?,
             tenant: tenant("COLLECTY_TENANT")?,
         };
         config.validate()?;
@@ -119,11 +133,23 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
         if self.queue.max_segment_age.is_zero() {
             return Err("COLLECTY_SEGMENT_MAX_AGE must be positive".to_string());
         }
+        if self
+            .host_metrics_interval
+            .is_some_and(|interval| interval.is_zero())
+        {
+            return Err("COLLECTY_HOST_METRICS_INTERVAL must be positive".to_string());
+        }
         if !(1..=22).contains(&self.zstd_level) {
             return Err(format!(
                 "COLLECTY_ZSTD_LEVEL is {} and must be between 1 and 22",
                 self.zstd_level
             ));
+        }
+        if (self.host_metrics_interval.is_some() || self.journal.is_some()) && self.tenant.is_none()
+        {
+            return Err(
+                "COLLECTY_TENANT is required when a collecty source is enabled".to_string(),
+            );
         }
         Ok(())
     }
@@ -230,6 +256,100 @@ fn duration(name: &str, fallback: Duration) -> Result<Duration, String> {
     }
 }
 
+fn optional_duration(name: &str) -> Result<Option<Duration>, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(value) => parse_duration(&value)
+            .map(Some)
+            .ok_or_else(|| format!("invalid {name} {value:?}: expected 500ms, 30s or 5m")),
+    }
+}
+
+fn journal_config() -> Result<Option<JournalConfig>, String> {
+    if !boolean("COLLECTY_JOURNAL", false)? {
+        return Ok(None);
+    }
+    let directory = match std::env::var("COLLECTY_JOURNAL_DIRECTORY") {
+        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+        Ok(_) => return Err("COLLECTY_JOURNAL_DIRECTORY must not be empty".to_string()),
+        Err(_) => None,
+    };
+    let units = list("COLLECTY_JOURNAL_UNITS", 64, 128)?;
+    let min_priority = priority("COLLECTY_JOURNAL_MIN_PRIORITY", 6)?;
+    Ok(Some(JournalConfig {
+        directory,
+        journalctl_path: path("COLLECTY_JOURNALCTL_PATH", PathBuf::from("journalctl")),
+        units,
+        min_priority,
+    }))
+}
+
+fn boolean(name: &str, fallback: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(fallback),
+        Ok(value) => parse_boolean(&value)
+            .ok_or_else(|| format!("invalid {name} {value:?}: expected true or false")),
+    }
+}
+
+fn parse_boolean(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn list(name: &str, max_items: usize, max_item_bytes: usize) -> Result<Vec<String>, String> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(Vec::new());
+    };
+    let mut values = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(format!(
+                "invalid {name} {value:?}: entries must not be empty"
+            ));
+        }
+        if item.len() > max_item_bytes {
+            return Err(format!(
+                "invalid {name}: an entry is over the {max_item_bytes} byte maximum"
+            ));
+        }
+        values.push(item.to_string());
+        if values.len() > max_items {
+            return Err(format!("invalid {name}: more than {max_items} entries"));
+        }
+    }
+    Ok(values)
+}
+
+fn priority(name: &str, fallback: u8) -> Result<u8, String> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(fallback);
+    };
+    let parsed = parse_priority(value.trim())
+        .ok_or_else(|| format!("invalid {name} {value:?}: expected 0-7 or info"))?;
+    Ok(parsed)
+}
+
+fn parse_priority(value: &str) -> Option<u8> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let parsed = match normalized.as_str() {
+        "emerg" => 0,
+        "alert" => 1,
+        "crit" => 2,
+        "err" | "error" => 3,
+        "warning" | "warn" => 4,
+        "notice" => 5,
+        "info" => 6,
+        "debug" => 7,
+        _ => normalized.parse::<u8>().ok()?,
+    };
+    (parsed <= 7).then_some(parsed)
+}
+
 pub fn parse_duration(value: &str) -> Option<Duration> {
     let value = value.trim();
     let (digits, unit) = match value {
@@ -289,6 +409,20 @@ mod tests {
     }
 
     #[test]
+    fn source_values_have_bounded_parsers() {
+        assert_eq!(parse_boolean("yes"), Some(true));
+        assert_eq!(parse_boolean("off"), Some(false));
+        assert_eq!(parse_boolean("sometimes"), None);
+        assert_eq!(parse_priority("warning"), Some(4));
+        assert_eq!(parse_priority("7"), Some(7));
+        assert_eq!(parse_priority("8"), None);
+        assert_eq!(
+            list("COLLECTY_TEST_UNSET_LIST", 4, 16).expect("unset"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn an_inflight_ceiling_below_the_request_ceiling_is_refused() {
         let config = Config {
             max_inflight_bytes: 1024,
@@ -318,5 +452,31 @@ mod tests {
     #[test]
     fn the_defaults_are_consistent() {
         Config::default().validate().expect("consistent defaults");
+    }
+
+    #[test]
+    fn a_source_needs_a_tenant_and_a_positive_interval() {
+        let missing_tenant = Config {
+            host_metrics_interval: Some(Duration::from_secs(15)),
+            ..Config::default()
+        };
+        assert!(
+            missing_tenant
+                .validate()
+                .expect_err("missing tenant")
+                .contains("COLLECTY_TENANT")
+        );
+
+        let zero_interval = Config {
+            host_metrics_interval: Some(Duration::ZERO),
+            tenant: Some("host".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            zero_interval
+                .validate()
+                .expect_err("zero interval")
+                .contains("COLLECTY_HOST_METRICS_INTERVAL")
+        );
     }
 }

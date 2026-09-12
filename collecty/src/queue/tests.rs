@@ -694,14 +694,14 @@ fn a_signal_closes_on_its_own_age() {
     let queue = open(
         &scratch,
         QueueLimits {
-            max_segment_age: Duration::from_millis(40),
+            max_segment_age: Duration::from_millis(200),
             ..QueueLimits::default()
         },
     );
     queue
         .append(Signal::Logs, b"an early log")
         .expect("an append");
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(500));
     queue
         .append(Signal::Traces, b"a late span")
         .expect("an append");

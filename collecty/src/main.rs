@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use collecty::config::Config;
-use collecty::observe::Reporter;
+use collecty::host_metrics::HostMetrics;
+use collecty::journal::{JournalRuntime, JournalSource};
+use collecty::observe::{Reporter, SourceStats};
 use collecty::queue::{Queue, Spool};
 use collecty::receive::{self, Intake};
 use collecty::send::{HttpTransport, Sender};
@@ -102,12 +104,51 @@ async fn run(config: Config) -> Result<(), String> {
     ));
 
     let sender = Sender::new(queue.clone(), spool.clone(), transport, config.sender);
+    let source_stats = Arc::new(SourceStats::default());
     let reporter = Reporter::new(
         queue.clone(),
         sender.stats(),
         spool.clone(),
         config.tenant.clone(),
+        source_stats.clone(),
     );
+    let host_metrics = match config.host_metrics_interval {
+        Some(_) => {
+            let tenant = config
+                .tenant
+                .clone()
+                .ok_or_else(|| "COLLECTY_TENANT is required for host metrics".to_string())?;
+            Some(
+                HostMetrics::new(config.host_metrics_root.clone(), tenant)
+                    .map_err(|error| format!("cannot initialize host metrics: {error}"))?,
+            )
+        }
+        None => None,
+    };
+    let journal = match config.journal.clone() {
+        Some(journal_config) => {
+            let tenant = config
+                .tenant
+                .clone()
+                .ok_or_else(|| "COLLECTY_TENANT is required for journald".to_string())?;
+            Some(
+                JournalSource::new(
+                    journal_config,
+                    config.host_metrics_root.clone(),
+                    config.data_dir.clone(),
+                    tenant,
+                    queue.sender_id(),
+                    JournalRuntime {
+                        intake: intake.clone(),
+                        spool: spool.clone(),
+                        source_stats: source_stats.clone(),
+                    },
+                )
+                .map_err(|error| format!("cannot initialize journald: {error}"))?,
+            )
+        }
+        None => None,
+    };
     let sending = {
         let watcher = watcher.clone();
         tokio::spawn(async move { sender.run(watcher).await })
@@ -119,6 +160,22 @@ async fn run(config: Config) -> Result<(), String> {
         config.report_interval,
         watcher.clone(),
     ));
+    let host_reporting = config.host_metrics_interval.map(|interval| {
+        let source = host_metrics.expect("host metrics source exists when interval is set");
+        let intake = intake.clone();
+        let watcher = watcher.clone();
+        tokio::spawn(host_metrics_loop(
+            source,
+            intake,
+            interval,
+            watcher,
+            source_stats.clone(),
+        ))
+    });
+    let journal_reporting = journal.map(|source| {
+        let watcher = watcher.clone();
+        tokio::spawn(source.run(watcher))
+    });
 
     tracing::info!(
         listen = %config.listen_addr,
@@ -139,6 +196,12 @@ async fn run(config: Config) -> Result<(), String> {
     let _ = shutdown.send(true);
     let _ = sending.await;
     let _ = reporting.await;
+    if let Some(host_reporting) = host_reporting {
+        let _ = host_reporting.await;
+    }
+    if let Some(journal_reporting) = journal_reporting {
+        let _ = journal_reporting.await;
+    }
 
     // The only `fsync` the queue has is the one that closes a segment, so
     // leaving without closing the open one would leave its records to be
@@ -156,6 +219,46 @@ async fn run(config: Config) -> Result<(), String> {
         Ok(Ok(())) => {}
     }
     served.map_err(|error| format!("the OTLP listener stopped: {error}"))
+}
+
+async fn host_metrics_loop(
+    source: HostMetrics,
+    intake: Arc<Intake>,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+    source_stats: Arc<SourceStats>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => return,
+        }
+        let export = match source.collect() {
+            Ok(export) => export,
+            Err(error) => {
+                source_stats
+                    .host_metrics_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(%error, host = source.host_name(), "collecty could not read host metrics");
+                continue;
+            }
+        };
+        if let Err(refusal) = intake
+            .accept(Signal::Metrics, vec![bytes::Bytes::from(export)])
+            .await
+        {
+            source_stats
+                .host_metrics_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(%refusal, "collecty could not queue host metrics");
+        } else {
+            source_stats
+                .host_metrics_exports
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 async fn wait_for_a_stop_signal() {

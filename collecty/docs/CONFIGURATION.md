@@ -40,6 +40,47 @@ signy serves is accepted here, queued, shipped, and dropped on arrival —
 counted in signy's `signy_ingest_dropped_resources_total` and nowhere on this
 side. Configure the exporting SDK, not collecty.
 
+## Built-in host sources
+
+Built-in sources are disabled by default. They are intended for a per-machine
+collecty deployment; a sidecar should leave them unset. Enabling either source
+requires `COLLECTY_TENANT`, which is written into the generated OTLP resource.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `COLLECTY_HOST_METRICS_INTERVAL` | unset | Enables Linux host metrics at this interval, e.g. `15s`; unset disables the source |
+| `COLLECTY_HOST_METRICS_ROOT` | `/` | Prefix for procfs, rootfs and hostname reads; set to `/host` when the host root is mounted there |
+| `COLLECTY_JOURNAL` | `false` | Enables the systemd journal source; accepts `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off` |
+| `COLLECTY_JOURNAL_DIRECTORY` | journalctl default | Journal directory passed to journalctl, useful for a read-only host mount |
+| `COLLECTY_JOURNALCTL_PATH` | `journalctl` | journalctl executable used by the source |
+| `COLLECTY_JOURNAL_UNITS` | unset | Comma-separated systemd units to follow; unset follows all units |
+| `COLLECTY_JOURNAL_MIN_PRIORITY` | `6` (`info`) | Highest numeric priority accepted; accepts `0`–`7` or `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` |
+
+Host metrics are emitted as `system.*` OTLP metrics with `host.name` and
+`tenant.id`. The current set covers CPU, memory, swap, load, filesystems, disk
+I/O and network I/O. Journal records use `MESSAGE` as the body, map `PRIORITY`
+to OTLP severity, and retain bounded systemd identity attributes.
+
+The journal source stores its cursor below `COLLECTY_DATA_DIR/sources/` and
+binds the checkpoint to the queue's sender identity. It appends a batch, closes
+and syncs the queue segment, then atomically replaces and syncs the cursor file.
+A crash may replay a batch, but cannot make a cursor point beyond durable queue
+data. Queue overflow still drops whole segments and is reported by the existing
+queue-drop counters.
+
+### Host deployment access
+
+On a native host, run collecty as an unprivileged account that can read the
+journal, normally through the distribution's `systemd-journal` group. The
+process does not enable a capability or change permissions itself.
+
+In a container, mount the host procfs and root filesystem read-only at the path
+selected by `COLLECTY_HOST_METRICS_ROOT`. For journald, mount the host journal
+directory read-only and set `COLLECTY_JOURNAL_DIRECTORY` to that in-container
+path. The container image includes `journalctl`, but the host's journal access
+permissions still apply; grant only the read access needed by the enabled
+source. Leave both mounts and both source settings out of a sidecar deployment.
+
 ## What bounds memory
 
 | Variable | Default | What it does |
@@ -141,7 +182,7 @@ time a larger batch helps.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_TENANT` | unset | Which tenant collecty's **own** `collecty_*` metrics are filed under. The only tenant collecty has an opinion about: everything it forwards carries its own inside the payload, which collecty never decodes. **Unset, the metrics are not exported at all** — signy drops an export naming no tenant and says nothing back, so producing them would queue and ship bytes to be thrown away. The stderr summary runs either way. Validated at startup against `[a-zA-Z0-9_-]{1,64}`, the grammar signy parses one with, so a typo fails the process instead of turning every self-export into a silent drop |
+| `COLLECTY_TENANT` | unset | Tenant for all telemetry collecty generates: `collecty_*` metrics, host metrics and journal logs. Everything it forwards carries its own tenant inside the payload, which collecty never decodes. **Unset, generated telemetry is not exported**. Validated at startup against `[a-zA-Z0-9_-]{1,64}` |
 | `COLLECTY_REPORT_INTERVAL` | `60s` | How often `collecty_*` metrics are produced and the stderr summary is written |
 | `COLLECTY_ZSTD_LEVEL` | `3` | 1 to 22. See the measurement below before raising it |
 | `COLLECTY_LOG_FORMAT` | `text` | `json` for a log a collector will read |
@@ -169,6 +210,10 @@ single series with no attributes.
 | `collecty_send_retries_total` | counter | Deliveries signy declined and that were retried |
 | `collecty_queue_dropped_bytes_total` | counter | Bytes **dropped** because the queue was full. Any movement is data loss |
 | `collecty_queue_dropped_segments_total` | counter | Segments unlinked while full |
+| `collecty_host_metrics_exports_total` | counter | Host metric exports admitted to the queue |
+| `collecty_host_metrics_errors_total` | counter | Host metric collections or queue admissions that failed |
+| `collecty_journal_exports_total` | counter | Journal records admitted to the queue and checkpointed |
+| `collecty_journal_errors_total` | counter | Journal parse, queue, durability or reader failures |
 
 These metrics are themselves an OTLP export, so they carry a tenant like any
 other — `COLLECTY_TENANT`, above. Without it they are not produced at all,
@@ -187,6 +232,8 @@ The process exits with status 2 and one line on stderr when:
 - `COLLECTY_QUEUE_MAX_BYTES` cannot hold a single `COLLECTY_MAX_REQUEST_BYTES` export
 - `COLLECTY_ZSTD_LEVEL` is outside 1 to 22
 - `COLLECTY_TENANT` is set to something signy would not parse as a tenant id
+- a built-in source is enabled without `COLLECTY_TENANT`
+- `COLLECTY_HOST_METRICS_INTERVAL` is zero
 - a size or duration cannot be parsed
 
 Each of these would otherwise start a process that refuses or destroys every

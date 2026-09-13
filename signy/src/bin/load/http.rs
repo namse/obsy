@@ -164,11 +164,7 @@ impl Conn {
                 "transfer-encoding" => {
                     chunked |= value.to_ascii_lowercase().contains("chunked");
                 }
-                "connection" => {
-                    if value.eq_ignore_ascii_case("close") {
-                        self.reusable = false;
-                    }
-                }
+                "connection" if value.eq_ignore_ascii_case("close") => self.reusable = false,
                 _ => {}
             }
         }

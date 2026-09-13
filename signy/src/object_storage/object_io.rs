@@ -117,7 +117,9 @@ impl ObjectStorage {
         };
         if let Err(error) = upload.complete().await {
             upload.abort().await.ok();
-            return Err(format!("failed to finish the upload for {subject}: {error}"));
+            return Err(format!(
+                "failed to finish the upload for {subject}: {error}"
+            ));
         }
         let upload_ms = started.elapsed().as_secs_f64() * 1000.0;
         // Every part over the chunk streams, which is most merge output. The
@@ -188,11 +190,10 @@ impl ObjectStorage {
         object_path: &ObjectPath,
         subject: &str,
     ) -> Result<(), String> {
-        let remote = self
-            .store
-            .head(object_path)
-            .await
-            .map_err(|error| format!("failed to verify existing object for {subject}: {error}"))?;
+        let remote =
+            self.store.head(object_path).await.map_err(|error| {
+                format!("failed to verify existing object for {subject}: {error}")
+            })?;
         if remote.size != len {
             return Err(format!("immutable object collision for {subject}"));
         }
@@ -212,9 +213,7 @@ impl ObjectStorage {
                     },
                 )
                 .await
-                .map_err(|error| {
-                    format!("failed to read existing object for {subject}: {error}")
-                })?
+                .map_err(|error| format!("failed to read existing object for {subject}: {error}"))?
                 .bytes()
                 .await
                 .map_err(|error| {
@@ -735,6 +734,116 @@ impl ObjectStorage {
         }
     }
 
+    pub async fn publish_flush_parts(
+        &self,
+        log_parts: &[Part],
+        trace_parts: &[TracePart],
+        metric_parts: &[SeriesPart],
+    ) -> Result<(Manifest, TraceManifest, MetricManifest), String> {
+        for part in log_parts {
+            let id = part.meta.id.clone();
+            crate::part::PartReader::open(part.clone())
+                .map_err(|error| format!("refusing to publish invalid part {id}: {error}"))?;
+            write_upload_marker(part)?;
+        }
+        for part in trace_parts {
+            let id = part.meta.id.clone();
+            TracePartReader::open(part.clone())
+                .map_err(|error| format!("refusing to publish invalid trace part {id}: {error}"))?;
+        }
+        for part in metric_parts {
+            let id = part.meta.id.clone();
+            SeriesPartReader::open(part.clone()).map_err(|error| {
+                format!("refusing to publish invalid metric part {id}: {error}")
+            })?;
+        }
+        for part in log_parts {
+            self.upload_part(part).await?;
+        }
+        for part in trace_parts {
+            self.upload_trace_part(part).await?;
+        }
+        for part in metric_parts {
+            self.upload_metric_part(part).await?;
+        }
+
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let log_added: Vec<ManifestPart> = log_parts.iter().map(ManifestPart::from).collect();
+        let trace_added: Vec<TraceManifestPart> = trace_parts
+            .iter()
+            .map(|part| TraceManifestPart {
+                id: part.meta.id.clone(),
+                partition: part.meta.partition.clone(),
+            })
+            .collect();
+        let metric_added: Vec<MetricManifestPart> =
+            metric_parts.iter().map(MetricManifestPart::from).collect();
+        for descriptor in &log_added {
+            if let Some(existing) = state
+                .manifest
+                .parts
+                .iter()
+                .find(|part| part.id == descriptor.id)
+                && existing != descriptor
+            {
+                return Err(format!("manifest part ID collision: {}", descriptor.id));
+            }
+        }
+        for descriptor in &trace_added {
+            if let Some(existing) = state
+                .trace_manifest
+                .parts
+                .iter()
+                .find(|part| part.id == descriptor.id)
+                && existing != descriptor
+            {
+                return Err(format!(
+                    "trace manifest part ID collision: {}",
+                    descriptor.id
+                ));
+            }
+        }
+        for descriptor in &metric_added {
+            if let Some(existing) = state
+                .metric_manifest
+                .parts
+                .iter()
+                .find(|part| part.id == descriptor.id)
+                && existing != descriptor
+            {
+                return Err(format!(
+                    "metric manifest part ID collision: {}",
+                    descriptor.id
+                ));
+            }
+        }
+        let all_present = log_added
+            .iter()
+            .all(|part| state.manifest.parts.contains(part))
+            && trace_added
+                .iter()
+                .all(|part| state.trace_manifest.parts.contains(part))
+            && metric_added
+                .iter()
+                .all(|part| state.metric_manifest.parts.contains(part));
+        let next = if all_present {
+            state
+        } else {
+            self.commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                log_added,
+                trace_added,
+                metric_added,
+                ..Default::default()
+            })
+            .await?
+        };
+        remove_upload_markers_best_effort(log_parts);
+        Ok((next.manifest, next.trace_manifest, next.metric_manifest))
+    }
+
     /// Uploads immutable part files, then atomically adds/removes their IDs in
     /// the manifest. Uploaded objects that lose a CAS race are harmless and
     /// will be collected by a future retention pass.
@@ -762,105 +871,61 @@ impl ObjectStorage {
             self.upload_part(part).await?;
         }
 
-        let _guard = self.manifest_update.lock().await;
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let loaded = self.load_manifest_versioned().await?;
-            // Before any of the reasoning below: if another writer has claimed
-            // the prefix, none of it applies to a manifest this instance no
-            // longer owns.
-            self.check_epoch(loaded.manifest.writer_epoch)?;
-            let mut next = loaded.manifest.clone();
-            let removed: HashSet<&str> = removed_ids.iter().map(String::as_str).collect();
-
-            // A CAS retry may observe that another writer already replaced
-            // one or more of our merge inputs. Reapplying this replacement
-            // would retain both writers' outputs and duplicate every row.
-            // Accept only an intact input set, or the exact idempotent state
-            // produced by an earlier successful attempt whose response was
-            // lost.
-            if !removed.is_empty() {
-                let present_removed = loaded
-                    .manifest
-                    .parts
-                    .iter()
-                    .filter(|part| removed.contains(part.id.as_str()))
-                    .count();
-                let all_added_present = added.iter().all(|part| {
-                    let descriptor = ManifestPart::from(part);
-                    loaded
-                        .manifest
-                        .parts
-                        .iter()
-                        .any(|existing| existing == &descriptor)
-                });
-                if present_removed == 0 && all_added_present {
-                    remove_upload_markers_best_effort(added);
-                    return Ok(loaded.manifest);
-                }
-                // The intact-input-set rule protects a *replacement*: there is
-                // an output that must not be retained alongside another
-                // writer's. A pure removal produces no output, so deleting
-                // whichever subset is still present reaches the same end state.
-                // Requiring an intact set here would wedge retention forever
-                // once a batch mixes ids an earlier tick already removed with
-                // ids that have only just expired.
-                if !added.is_empty() && present_removed != removed.len() {
-                    return Err(format!(
-                        "{INPUTS_CHANGED_ERROR}: expected {} input parts, found {present_removed}",
-                        removed.len()
-                    ));
-                }
-            }
-            next.parts
-                .retain(|part| !removed.contains(part.id.as_str()));
-            for part in added.iter().map(ManifestPart::from) {
-                if let Some(existing) = next.parts.iter().find(|item| item.id == part.id) {
-                    if existing != &part {
-                        return Err(format!("manifest part ID collision: {}", part.id));
-                    }
-                } else {
-                    next.parts.push(part);
-                }
-            }
-            next.parts.sort_by(|left, right| {
-                (&left.partition, &left.id).cmp(&(&right.partition, &right.id))
-            });
-            if next.parts == loaded.manifest.parts {
-                remove_upload_markers_best_effort(added);
-                return Ok(loaded.manifest);
-            }
-            next.generation = loaded
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let removed: Vec<String> = removed_ids.to_vec();
+        let descriptors: Vec<ManifestPart> = added.iter().map(ManifestPart::from).collect();
+        if !removed.is_empty() {
+            let present_removed = state
                 .manifest
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode manifest: {error}"))?;
-            let mode = match loaded.version {
-                Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
-                Some(version) => PutMode::Update(version),
-                None => PutMode::Create,
-            };
-            let options = PutOptions {
-                mode,
-                ..Default::default()
-            };
-            match self
-                .store
-                .put_opts(&self.manifest_path(), body.into(), options)
-                .await
-            {
-                Ok(_) => {
-                    remove_upload_markers_best_effort(added);
-                    return Ok(next);
-                }
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to update manifest: {error}")),
+                .parts
+                .iter()
+                .filter(|part| removed.iter().any(|id| id == &part.id))
+                .count();
+            let all_added_present = descriptors
+                .iter()
+                .all(|descriptor| state.manifest.parts.contains(descriptor));
+            if present_removed == 0 && all_added_present {
+                remove_upload_markers_best_effort(added);
+                return Ok(state.manifest);
+            }
+            if !descriptors.is_empty() && present_removed != removed.len() {
+                return Err(format!(
+                    "{INPUTS_CHANGED_ERROR}: expected {} input parts, found {present_removed}",
+                    removed.len()
+                ));
             }
         }
-        Err("manifest compare-and-swap retry limit exceeded".to_string())
+        for descriptor in &descriptors {
+            if let Some(existing) = state
+                .manifest
+                .parts
+                .iter()
+                .find(|item| item.id == descriptor.id)
+                && existing != descriptor
+                && !removed.iter().any(|id| id == &descriptor.id)
+            {
+                return Err(format!("manifest part ID collision: {}", descriptor.id));
+            }
+        }
+        if removed.is_empty()
+            && descriptors
+                .iter()
+                .all(|descriptor| state.manifest.parts.contains(descriptor))
+        {
+            remove_upload_markers_best_effort(added);
+            return Ok(state.manifest);
+        }
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                log_added: descriptors,
+                log_removed: removed,
+                ..Default::default()
+            })
+            .await?;
+        remove_upload_markers_best_effort(added);
+        Ok(next.manifest)
     }
-
 }
-

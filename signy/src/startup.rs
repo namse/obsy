@@ -219,14 +219,26 @@ pub async fn run(config: Arc<Config>) {
     // starts the replacement before the original has finished draining.
     //
     // Retried like every other startup step that touches the store. A claim
-    // writes three manifests, and a transient failure on the last one leaves
-    // the prefix half-claimed -- exactly the state the paragraph above exists
-    // to avoid. Dying there only hands the same work to the orchestrator's
+    // writes one replicated catalog commit, and a transient failure while
+    // creating its second replica leaves a recoverable half-commit. Dying
+    // there only hands the same work to the orchestrator's
     // restart; retrying does it without the bounce. The epoch only ever moves
     // forward, so a retry costs a number, not a guarantee.
     if let Some(storage) = &object_storage {
+        with_object_store_retry("catalog protection preflight", startup_budget, || async {
+            storage.verify_catalog_protection()
+        })
+        .await;
+        with_object_store_retry("conditional write preflight", startup_budget, || {
+            storage.verify_conditional_put()
+        })
+        .await;
         with_object_store_retry("writer epoch claim", startup_budget, || {
             storage.claim_writer_epoch()
+        })
+        .await;
+        with_object_store_retry("catalog listing preflight", startup_budget, || {
+            storage.verify_catalog_listing()
         })
         .await;
     }

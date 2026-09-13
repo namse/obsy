@@ -184,7 +184,11 @@ async fn drop_log_parts_from_manifest(
     config: &Config,
     ids: &[String],
 ) -> Result<(), String> {
-    match tokio::time::timeout(config.max_retention_runtime, cache.storage.publish(&[], ids)).await
+    match tokio::time::timeout(
+        config.max_retention_runtime,
+        cache.storage.publish(&[], ids),
+    )
+    .await
     {
         Ok(Ok(_)) => cache.record_remote_success(),
         Ok(Err(error)) => {
@@ -460,13 +464,13 @@ async fn retention_once_at(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::object_storage::ObjectStorage;
-    use std::collections::HashSet;
     use crate::memtable::Labels;
+    use crate::object_storage::ObjectStorage;
     use crate::part::{self, Row};
     use crate::tenant::TenantId;
     use crate::tenant_policy::TenantRetention;
     use crate::trace::TraceSpan;
+    use std::collections::HashSet;
 
     fn tenant(raw: &str) -> TenantId {
         TenantId::parse(raw).expect("valid tenant id")
@@ -1220,9 +1224,12 @@ mod tests {
     async fn reader_across_retirement(registry_first: bool) -> Result<(), String> {
         let storage = Arc::new(ObjectStorage::in_memory());
         let parts_root = temp_root("replan-gap").join("parts");
-        let parts =
-            part::flush_rows(vec![row_for("t", 1_700_000_000_000_000_000)], &parts_root, 100)
-                .unwrap();
+        let parts = part::flush_rows(
+            vec![row_for("t", 1_700_000_000_000_000_000)],
+            &parts_root,
+            100,
+        )
+        .unwrap();
         storage.publish(&parts, &[]).await.unwrap();
         let ids = vec![parts[0].meta.id.clone()];
 

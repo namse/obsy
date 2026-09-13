@@ -300,6 +300,14 @@ impl ObjectStore for LatencyFaultStore {
         self.inner.list(prefix)
     }
 
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.shape_read().await;
         self.inner.list_with_delimiter(prefix).await

@@ -44,7 +44,8 @@ side. Configure the exporting SDK, not collecty.
 
 Built-in sources are disabled by default. They are intended for a per-machine
 collecty deployment; a sidecar should leave them unset. Enabling either source
-requires `COLLECTY_TENANT`, which is written into the generated OTLP resource.
+requires `COLLECTY_GENERATED_TELEMETRY_TENANT_ID`, which is written into the
+generated OTLP resource.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -182,7 +183,7 @@ time a larger batch helps.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COLLECTY_TENANT` | unset | Tenant for all telemetry collecty generates: `collecty_*` metrics, host metrics and journal logs. Everything it forwards carries its own tenant inside the payload, which collecty never decodes. **Unset, generated telemetry is not exported**. Validated at startup against `[a-zA-Z0-9_-]{1,64}` |
+| `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` | unset | Tenant for all telemetry collecty generates: `collecty_*` metrics, host metrics and journal logs. Everything it forwards carries its own tenant inside the payload, which collecty never decodes. **Unset, generated telemetry is not exported**. Validated at startup against `[a-zA-Z0-9_-]{1,64}` |
 | `COLLECTY_REPORT_INTERVAL` | `60s` | How often `collecty_*` metrics are produced and the stderr summary is written |
 | `COLLECTY_ZSTD_LEVEL` | `3` | 1 to 22. See the measurement below before raising it |
 | `COLLECTY_LOG_FORMAT` | `text` | `json` for a log a collector will read |
@@ -216,7 +217,7 @@ single series with no attributes.
 | `collecty_journal_errors_total` | counter | Journal parse, queue, durability or reader failures |
 
 These metrics are themselves an OTLP export, so they carry a tenant like any
-other — `COLLECTY_TENANT`, above. Without it they are not produced at all,
+other — `COLLECTY_GENERATED_TELEMETRY_TENANT_ID`, above. Without it they are not produced at all,
 because signy would drop them without saying so.
 
 Records are counted where they arrive and not where they leave: what a segment
@@ -231,8 +232,8 @@ The process exits with status 2 and one line on stderr when:
 - `COLLECTY_QUEUE_MAX_BYTES` is below `COLLECTY_QUEUE_SEGMENT_BYTES`
 - `COLLECTY_QUEUE_MAX_BYTES` cannot hold a single `COLLECTY_MAX_REQUEST_BYTES` export
 - `COLLECTY_ZSTD_LEVEL` is outside 1 to 22
-- `COLLECTY_TENANT` is set to something signy would not parse as a tenant id
-- a built-in source is enabled without `COLLECTY_TENANT`
+- `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` is set to something signy would not parse as a tenant id
+- a built-in source is enabled without `COLLECTY_GENERATED_TELEMETRY_TENANT_ID`
 - `COLLECTY_HOST_METRICS_INTERVAL` is zero
 - a size or duration cannot be parsed
 

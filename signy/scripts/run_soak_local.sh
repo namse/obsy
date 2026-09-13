@@ -150,12 +150,12 @@ COLLECTY_INFLIGHT="${SOAK_COLLECTY_INFLIGHT:-64MiB}"
 COLLECTY_QUEUE_MAX="${SOAK_COLLECTY_QUEUE_MAX:-1GiB}"
 COLLECTY_SEGMENT="${SOAK_COLLECTY_SEGMENT:-8MiB}"
 COLLECTY_UNIT="soak-collecty-$NAME"
-# The tenant collecty files its own metrics under. The load harness's first
-# corpus tenant, so the collector's counters land where this run's queries can
+# The tenant collecty-generated telemetry is filed under. The load harness's
+# first corpus tenant, so the collector's counters land where this run's queries can
 # read them — an export naming a tenant the instance does not serve is dropped
 # on arrival and said nothing about, so an unserved tenant here would silently
 # delete the collector's own evidence.
-COLLECTY_TENANT="${SOAK_COLLECTY_TENANT:-load-tenant-000}"
+COLLECTY_GENERATED_TELEMETRY_TENANT_ID="${SOAK_COLLECTY_GENERATED_TELEMETRY_TENANT_ID:-load-tenant-000}"
 # The trace leg. Off in every soak so far, and its read routes have never been
 # crossed by a long run at all — see the harness's trace read-back, which this
 # turns on with it.
@@ -311,7 +311,7 @@ start_collecty() {
       COLLECTY_MAX_INFLIGHT_BYTES="$COLLECTY_INFLIGHT" \
       COLLECTY_QUEUE_MAX_BYTES="$COLLECTY_QUEUE_MAX" \
       COLLECTY_QUEUE_SEGMENT_BYTES="$COLLECTY_SEGMENT" \
-      COLLECTY_TENANT="$COLLECTY_TENANT" \
+      COLLECTY_GENERATED_TELEMETRY_TENANT_ID="$COLLECTY_GENERATED_TELEMETRY_TENANT_ID" \
       COLLECTY_REPORT_INTERVAL="30s" \
       systemd-run --user --scope --quiet --unit="$COLLECTY_UNIT" \
         -p MemoryMax="$COLLECTY_LIMIT" -p MemorySwapMax=0 \
@@ -330,9 +330,9 @@ start_collecty() {
 
 touch "$OUT/RUNNING"
 start_signy || exit 1
-# The collector's tenant, onboarded before the collector exists.
+# The generated-telemetry tenant, onboarded before the collector exists.
 #
-# collecty exports its own metrics the moment it is up, and the harness that
+# collecty exports its generated telemetry the moment it is up, and the harness that
 # pushes tenant policies does not start until after it. That left a window of
 # about a second and a half in which signy was serving no tenant by that name
 # and refused the export, exactly as it is specified to -- one dropped resource
@@ -343,8 +343,8 @@ if [ "$COLLECTY" != "off" ]; then
   curl -fsS --max-time 10 -X PUT \
     -H 'Content-Type: application/json' \
     -d "{\"retention\": \"$TENANT_RETENTION\"}" \
-    "http://127.0.0.1:$PORT/signy/api/v1/admin/tenants/$COLLECTY_TENANT/retention" \
-    >/dev/null || echo "warning: could not onboard $COLLECTY_TENANT before collecty"
+    "http://127.0.0.1:$PORT/signy/api/v1/admin/tenants/$COLLECTY_GENERATED_TELEMETRY_TENANT_ID/retention" \
+    >/dev/null || echo "warning: could not onboard $COLLECTY_GENERATED_TELEMETRY_TENANT_ID before collecty"
 fi
 start_collecty || exit 1
 
@@ -577,7 +577,7 @@ fi
 if [ "$PROBE_INTERVAL" -gt 0 ] 2>/dev/null; then
   PROBE_ADDR="127.0.0.1:$PORT" \
   PROBE_INTERVAL="$PROBE_INTERVAL" \
-  PROBE_TENANT="$COLLECTY_TENANT" \
+  PROBE_TENANT="$COLLECTY_GENERATED_TELEMETRY_TENANT_ID" \
     "$ROOT/scripts/soak_probe.sh" "$OUT" >"$OUT/probe.log" 2>&1 &
   PROBE_PID=$!
 fi
@@ -1064,11 +1064,11 @@ GUARD=ok
   # is the queue full and unlinking the oldest.
   if [ "$COLLECTY" != "off" ] && [ "$ALIVE" = true ]; then
     collecty_metric() {
-      curl -fsS --max-time 10 -H "X-Tenant-Id: $COLLECTY_TENANT" \
+      curl -fsS --max-time 10 -H "X-Tenant-Id: $COLLECTY_GENERATED_TELEMETRY_TENANT_ID" \
         "http://127.0.0.1:$PORT/signy/api/v1/metrics/instant?metric=$1" 2>/dev/null \
         | head -1 | jq -r '.value // "-"' 2>/dev/null
       }
-    echo "collecty (counters read back through signy, tenant $COLLECTY_TENANT):"
+    echo "collecty (counters read back through signy, tenant $COLLECTY_GENERATED_TELEMETRY_TENANT_ID):"
     printf "  %-28s %s\n" "records_appended" "$(collecty_metric collecty_records_appended_total)"
     printf "  %-28s %s\n" "segments_sent" "$(collecty_metric collecty_segments_sent_total)"
     printf "  %-28s %s\n" "bytes_appended" "$(collecty_metric collecty_bytes_appended_total)"

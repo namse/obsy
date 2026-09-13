@@ -24,8 +24,8 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Transport to signy | `POST /signy/api/v1/collect` with `Content-Encoding: zstd`, one route for all three signals, each request naming its own |
 | Sender identity | Random 16 bytes made with the queue directory, in a file of their own. Not configurable, and not the hostname — it names the queue, not the machine |
 | What a request carries | **One closed segment, from its first record.** Never part of one, and never the segment still being written |
-| Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Collecty-generated metrics and enabled host-source telemetry use `COLLECTY_TENANT` — see below |
-| Self-observation | `collecty_*` metrics and enabled host-source telemetry are encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. `COLLECTY_TENANT` names every export collecty builds; unset means none of those exports are built |
+| Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Collecty-generated metrics and enabled host-source telemetry use `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` — see below |
+| Self-observation | `collecty_*` metrics and enabled host-source telemetry are encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` names every export collecty builds; unset means none of those exports are built |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
 | Transport security | **None, by design.** No TLS and no authentication on either hop, so **the bind address is the access control**: the default is loopback, and anything wider is expected to stay inside a trust boundary |
 
@@ -341,7 +341,7 @@ synced. A crash before the cursor sync replays entries; it may duplicate them,
 but it cannot advance the cursor beyond durable queued data. Queue overflow
 still drops whole segments and is reported as explicit data loss.
 
-`COLLECTY_TENANT` is required whenever a built-in source is enabled. The
+`COLLECTY_GENERATED_TELEMETRY_TENANT_ID` is required whenever a built-in source is enabled. The
 source-generated resource always carries that tenant, `service.name=collecty`
 and the stable host identity. If a required host path, journal reader or
 permission is unavailable, startup or the source health log reports the

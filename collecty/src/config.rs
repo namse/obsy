@@ -27,7 +27,7 @@ pub struct Config {
     /// Everything collecty forwards carries its own tenant in the payload,
     /// which collecty never decodes. Collecty-generated metrics and host
     /// sources use this value. Unset disables generated exports.
-    pub tenant: Option<String>,
+    pub generated_telemetry_tenant: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,7 +57,7 @@ impl Default for Config {
             host_metrics_interval: None,
             host_metrics_root: PathBuf::from("/"),
             journal: None,
-            tenant: None,
+            generated_telemetry_tenant: None,
         }
     }
 }
@@ -96,7 +96,7 @@ impl Config {
             host_metrics_interval: optional_duration("COLLECTY_HOST_METRICS_INTERVAL")?,
             host_metrics_root: path("COLLECTY_HOST_METRICS_ROOT", defaults.host_metrics_root),
             journal: journal_config()?,
-            tenant: tenant("COLLECTY_TENANT")?,
+            generated_telemetry_tenant: tenant_id("COLLECTY_GENERATED_TELEMETRY_TENANT_ID")?,
         };
         config.validate()?;
         Ok(config)
@@ -145,10 +145,12 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
                 self.zstd_level
             ));
         }
-        if (self.host_metrics_interval.is_some() || self.journal.is_some()) && self.tenant.is_none()
+        if (self.host_metrics_interval.is_some() || self.journal.is_some())
+            && self.generated_telemetry_tenant.is_none()
         {
             return Err(
-                "COLLECTY_TENANT is required when a collecty source is enabled".to_string(),
+                "COLLECTY_GENERATED_TELEMETRY_TENANT_ID is required when a collecty source is enabled"
+                    .to_string(),
             );
         }
         Ok(())
@@ -164,9 +166,9 @@ fn string(name: &str, fallback: String) -> String {
 }
 
 /// The same grammar signy validates a tenant id against, checked here so a
-/// typo fails startup rather than turning every self-export into a drop nobody
+/// typo fails startup rather than turning every generated export into a drop nobody
 /// asked about.
-fn tenant(name: &str) -> Result<Option<String>, String> {
+fn tenant_id(name: &str) -> Result<Option<String>, String> {
     let Ok(value) = std::env::var(name) else {
         return Ok(None);
     };
@@ -464,12 +466,12 @@ mod tests {
             missing_tenant
                 .validate()
                 .expect_err("missing tenant")
-                .contains("COLLECTY_TENANT")
+                .contains("COLLECTY_GENERATED_TELEMETRY_TENANT_ID")
         );
 
         let zero_interval = Config {
             host_metrics_interval: Some(Duration::ZERO),
-            tenant: Some("host".to_string()),
+            generated_telemetry_tenant: Some("host".to_string()),
             ..Config::default()
         };
         assert!(

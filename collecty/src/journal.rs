@@ -31,7 +31,7 @@ const CHECKPOINT_VERSION: &str = "v1";
 
 pub struct JournalSource {
     config: JournalConfig,
-    tenant: String,
+    tenant_id: String,
     host_name: String,
     checkpoint: Checkpoint,
     intake: Arc<Intake>,
@@ -60,7 +60,7 @@ impl JournalSource {
         config: JournalConfig,
         root: impl Into<PathBuf>,
         data_dir: impl Into<PathBuf>,
-        tenant: impl Into<String>,
+        tenant_id: impl Into<String>,
         sender: SenderId,
         runtime: JournalRuntime,
     ) -> io::Result<Self> {
@@ -77,7 +77,7 @@ impl JournalSource {
         probe_journalctl(&config)?;
         Ok(Self {
             config,
-            tenant: tenant.into(),
+            tenant_id: tenant_id.into(),
             host_name,
             checkpoint: Checkpoint {
                 path: data_dir.into().join("sources/journal.cursor"),
@@ -207,7 +207,7 @@ impl JournalSource {
     }
 
     fn payload_size(&self, batch: &[JournalRecord]) -> usize {
-        encode(batch, &self.host_name, &self.tenant)
+        encode(batch, &self.host_name, &self.tenant_id)
             .encode_to_vec()
             .len()
     }
@@ -221,7 +221,7 @@ impl JournalSource {
             return Ok(());
         }
         let cursor = batch.last().expect("a non-empty batch").cursor.clone();
-        let payload = encode(batch, &self.host_name, &self.tenant).encode_to_vec();
+        let payload = encode(batch, &self.host_name, &self.tenant_id).encode_to_vec();
         if payload.len() > self.intake.max_request_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -354,12 +354,12 @@ fn parse_line(line: &str) -> io::Result<JournalRecord> {
     })
 }
 
-fn encode(batch: &[JournalRecord], host_name: &str, tenant: &str) -> ExportLogsServiceRequest {
+fn encode(batch: &[JournalRecord], host_name: &str, tenant_id: &str) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
                 attributes: vec![
-                    attribute(TENANT_ATTRIBUTE, tenant),
+                    attribute(TENANT_ATTRIBUTE, tenant_id),
                     attribute("service.name", "collecty"),
                     attribute("host.name", host_name),
                 ],
@@ -521,7 +521,7 @@ mod tests {
                 units: Vec::new(),
                 min_priority: 6,
             },
-            tenant: "tenant".to_string(),
+            tenant_id: "tenant".to_string(),
             host_name: "host".to_string(),
             checkpoint: Checkpoint {
                 path: scratch.path().join("sources/journal.cursor"),

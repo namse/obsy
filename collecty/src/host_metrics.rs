@@ -25,7 +25,7 @@ const MAX_INTERFACES: usize = 256;
 #[derive(Clone, Debug)]
 pub struct HostMetrics {
     root: PathBuf,
-    tenant: String,
+    tenant_id: String,
     host_name: String,
     boot_time_unix_nanos: u64,
     ticks_per_second: f64,
@@ -53,9 +53,9 @@ enum Value {
 }
 
 impl HostMetrics {
-    pub fn new(root: impl Into<PathBuf>, tenant: impl Into<String>) -> io::Result<Self> {
+    pub fn new(root: impl Into<PathBuf>, tenant_id: impl Into<String>) -> io::Result<Self> {
         let root = root.into();
-        let tenant = tenant.into();
+        let tenant_id = tenant_id.into();
         let host_name = read_trimmed(&root.join("etc/hostname"))?;
         let stat = read_required(&root, "proc/stat")?;
         for relative in [
@@ -75,7 +75,7 @@ impl HostMetrics {
         };
         Ok(Self {
             root,
-            tenant,
+            tenant_id,
             host_name,
             boot_time_unix_nanos: boot_seconds.saturating_mul(1_000_000_000),
             ticks_per_second,
@@ -99,7 +99,7 @@ impl HostMetrics {
             self.boot_time_unix_nanos,
             now,
             &self.host_name,
-            &self.tenant,
+            &self.tenant_id,
         ))
     }
 
@@ -108,7 +108,13 @@ impl HostMetrics {
     }
 }
 
-fn encode(points: Vec<Point>, start_time: u64, now: u64, host_name: &str, tenant: &str) -> Vec<u8> {
+fn encode(
+    points: Vec<Point>,
+    start_time: u64,
+    now: u64,
+    host_name: &str,
+    tenant_id: &str,
+) -> Vec<u8> {
     let metrics = points
         .into_iter()
         .map(|point| {
@@ -152,7 +158,7 @@ fn encode(points: Vec<Point>, start_time: u64, now: u64, host_name: &str, tenant
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
                 attributes: vec![
-                    attribute(TENANT_ATTRIBUTE, tenant),
+                    attribute(TENANT_ATTRIBUTE, tenant_id),
                     attribute("service.name", "collecty"),
                     attribute("host.name", host_name),
                 ],

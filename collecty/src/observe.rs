@@ -156,7 +156,7 @@ pub struct Reporter {
     stats: Arc<SenderStats>,
     spool: Spool,
     started_unix_nanos: u64,
-    tenant: Option<String>,
+    generated_telemetry_tenant: Option<String>,
     source_stats: Arc<SourceStats>,
 }
 
@@ -165,7 +165,7 @@ impl Reporter {
         queue: Arc<Queue>,
         stats: Arc<SenderStats>,
         spool: Spool,
-        tenant: Option<String>,
+        generated_telemetry_tenant: Option<String>,
         source_stats: Arc<SourceStats>,
     ) -> Reporter {
         Reporter {
@@ -173,7 +173,7 @@ impl Reporter {
             stats,
             spool,
             started_unix_nanos: unix_nanos(),
-            tenant,
+            generated_telemetry_tenant,
             source_stats,
         }
     }
@@ -212,12 +212,12 @@ impl Reporter {
     /// away. The stderr summary below runs either way, so the numbers are
     /// still available — only the push of them is not.
     pub fn export(&self, observed: &Observation) -> Option<Vec<u8>> {
-        let tenant = self.tenant.as_deref()?;
+        let tenant_id = self.generated_telemetry_tenant.as_deref()?;
         Some(encode(
             observed,
             self.started_unix_nanos,
             unix_nanos(),
-            tenant,
+            tenant_id,
         ))
     }
 
@@ -255,11 +255,10 @@ impl Reporter {
     }
 }
 
-/// `tenant` is stamped onto the resource because that is where signy reads it
-/// from. collecty never writes it onto anything it forwards — those carry
-/// their own, and collecty does not decode them — so this export is the one
-/// place it names a tenant at all.
-pub fn encode(observed: &Observation, started: u64, now: u64, tenant: &str) -> Vec<u8> {
+/// The tenant ID is stamped onto the generated metrics resource because that
+/// is where signy reads it from. collecty never writes it onto anything it
+/// forwards — those carry their own, and collecty does not decode them.
+pub fn encode(observed: &Observation, started: u64, now: u64, tenant_id: &str) -> Vec<u8> {
     let metrics = FAMILIES
         .iter()
         .map(|family| {
@@ -293,7 +292,7 @@ pub fn encode(observed: &Observation, started: u64, now: u64, tenant: &str) -> V
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
                 attributes: vec![
-                    attribute(crate::TENANT_ATTRIBUTE, tenant),
+                    attribute(crate::TENANT_ATTRIBUTE, tenant_id),
                     attribute("service.name", "collecty"),
                 ],
                 ..Default::default()

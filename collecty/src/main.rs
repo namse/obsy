@@ -109,17 +109,16 @@ async fn run(config: Config) -> Result<(), String> {
         queue.clone(),
         sender.stats(),
         spool.clone(),
-        config.tenant.clone(),
+        config.generated_telemetry_tenant.clone(),
         source_stats.clone(),
     );
     let host_metrics = match config.host_metrics_interval {
         Some(_) => {
-            let tenant = config
-                .tenant
-                .clone()
-                .ok_or_else(|| "COLLECTY_TENANT is required for host metrics".to_string())?;
+            let tenant_id = config.generated_telemetry_tenant.clone().ok_or_else(|| {
+                "COLLECTY_GENERATED_TELEMETRY_TENANT_ID is required for host metrics".to_string()
+            })?;
             Some(
-                HostMetrics::new(config.host_metrics_root.clone(), tenant)
+                HostMetrics::new(config.host_metrics_root.clone(), tenant_id)
                     .map_err(|error| format!("cannot initialize host metrics: {error}"))?,
             )
         }
@@ -127,16 +126,15 @@ async fn run(config: Config) -> Result<(), String> {
     };
     let journal = match config.journal.clone() {
         Some(journal_config) => {
-            let tenant = config
-                .tenant
-                .clone()
-                .ok_or_else(|| "COLLECTY_TENANT is required for journald".to_string())?;
+            let tenant_id = config.generated_telemetry_tenant.clone().ok_or_else(|| {
+                "COLLECTY_GENERATED_TELEMETRY_TENANT_ID is required for journald".to_string()
+            })?;
             Some(
                 JournalSource::new(
                     journal_config,
                     config.host_metrics_root.clone(),
                     config.data_dir.clone(),
-                    tenant,
+                    tenant_id,
                     queue.sender_id(),
                     JournalRuntime {
                         intake: intake.clone(),

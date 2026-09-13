@@ -537,6 +537,39 @@ async fn a_verified_https_certificate_and_hostname_are_required() {
 }
 
 #[tokio::test]
+async fn https_keeps_refusal_and_retry_status_contracts() {
+    let refusing_seen = Arc::new(Mutex::new(Vec::new()));
+    let (refusing_address, refusing_certificate) =
+        fake_https_signy(http::StatusCode::BAD_REQUEST, refusing_seen).await;
+    let refusing = HttpTransport::with_tls_config(
+        format!("https://localhost:{}", refusing_address.port()),
+        Duration::from_secs(5),
+        None,
+        None,
+        client_config_trusting(refusing_certificate),
+    );
+    assert!(matches!(
+        refusing.deliver(shipment(b"frames")).await,
+        Outcome::Refused(_)
+    ));
+
+    let retrying_seen = Arc::new(Mutex::new(Vec::new()));
+    let (retrying_address, retrying_certificate) =
+        fake_https_signy(http::StatusCode::SERVICE_UNAVAILABLE, retrying_seen).await;
+    let retrying = HttpTransport::with_tls_config(
+        format!("https://localhost:{}", retrying_address.port()),
+        Duration::from_secs(5),
+        None,
+        None,
+        client_config_trusting(retrying_certificate),
+    );
+    assert!(matches!(
+        retrying.deliver(shipment(b"frames")).await,
+        Outcome::Retry(_)
+    ));
+}
+
+#[tokio::test]
 async fn an_untrusted_or_mismatched_https_certificate_is_rejected() {
     let untrusted_seen = Arc::new(Mutex::new(Vec::new()));
     let (untrusted_address, _) =

@@ -14,12 +14,17 @@ rejected, because a number with no unit is a guess about which unit was meant.
 |---|---|---|
 | `COLLECTY_LISTEN_ADDR` | `127.0.0.1:4318` | Where applications export to, over OTLP/HTTP. The default answers only the machine it runs on; a sidecar or host daemon other containers export to needs `0.0.0.0:4318`, which the image sets |
 | `COLLECTY_DATA_DIR` | `/var/lib/collecty` | Holds the queue, under `queue/`. **This directory is the only copy of an acknowledged export until signy takes it** — it must outlive the container |
-| `COLLECTY_SIGNY_URL` | `http://127.0.0.1:3100` | Where batches go. Plain HTTP only |
+| `COLLECTY_SIGNY_URL` | `http://127.0.0.1:3100` | Where batches go. `http://` and `https://` are supported; HTTPS verifies the normal public certificate chain and hostname |
+| `COLLECTY_SIGNY_ACCESS_CLIENT_ID` | unset | Cloudflare Access service-token client ID, sent as `CF-Access-Client-Id` when the secret is also set |
+| `COLLECTY_SIGNY_ACCESS_CLIENT_SECRET` | unset | Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret` when the ID is also set |
 
-There is no authentication and no TLS, so **the bind address is the whole of
-the access control**. Binding a routable address publishes an endpoint that
-takes anything anyone sends it; it belongs behind the same trust boundary as
-the hop to signy.
+The collecty ingest listener has no authentication and no TLS, so **its bind
+address is the whole of the access control**. Binding a routable address
+publishes an endpoint that takes anything anyone sends it; keep it inside the
+same trust boundary as the applications that export to it. The outbound hop
+to signy may use HTTPS and Cloudflare Access service-token headers. Set both
+Access variables together; the values are never included in log messages or
+delivery error reasons.
 
 Three paths are served, and nothing else: `POST /v1/logs`, `POST /v1/traces`
 and `POST /v1/metrics`. The body must be an uncompressed OTLP protobuf export

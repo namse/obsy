@@ -537,7 +537,11 @@ async fn flush_once(
                     series_memtable.abort_flush(series_snapshot);
                     return Err(format!("failed to record flush transaction: {error}"));
                 }
-                if let Err(error) = cache.storage.publish(&new_parts, &[]).await {
+                if let Err(error) = cache
+                    .storage
+                    .publish_flush_parts(&new_parts, &new_trace_parts, &new_series_parts)
+                    .await
+                {
                     cache.record_remote_failure();
                     let rollback_error = cache
                         .storage
@@ -562,66 +566,6 @@ async fn flush_once(
                                 "object-store publish failed: {error}; rollback failed: {rollback_error}"
                             ),
                             None => format!("object-store publish failed: {error}"),
-                        },
-                    });
-                }
-                if let Err(error) = cache.storage.publish_trace_parts(&new_trace_parts).await {
-                    cache.record_remote_failure();
-                    let rollback_error = cache
-                        .storage
-                        .rollback_flush_transaction(&config.data_dir)
-                        .await
-                        .err();
-                    let cleanup_error = cleanup_part_directories(
-                        &new_part_dirs,
-                        &new_trace_part_dirs,
-                        &new_series_part_dirs,
-                    )
-                    .err();
-                    memtable.abort_flush(ckpt.snapshot);
-                    trace_memtable.abort_flush(trace_spans);
-                    series_memtable.abort_flush(series_snapshot);
-                    return Err(match cleanup_error {
-                        Some(cleanup_error) => format!(
-                            "trace object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
-                        ),
-                        None => match rollback_error {
-                            Some(rollback_error) => format!(
-                                "trace object-store publish failed: {error}; rollback failed: {rollback_error}"
-                            ),
-                            None => format!("trace object-store publish failed: {error}"),
-                        },
-                    });
-                }
-                if let Err(error) = cache
-                    .storage
-                    .publish_metric_parts(&new_series_parts, &[])
-                    .await
-                {
-                    cache.record_remote_failure();
-                    let rollback_error = cache
-                        .storage
-                        .rollback_flush_transaction(&config.data_dir)
-                        .await
-                        .err();
-                    let cleanup_error = cleanup_part_directories(
-                        &new_part_dirs,
-                        &new_trace_part_dirs,
-                        &new_series_part_dirs,
-                    )
-                    .err();
-                    memtable.abort_flush(ckpt.snapshot);
-                    trace_memtable.abort_flush(trace_spans);
-                    series_memtable.abort_flush(series_snapshot);
-                    return Err(match cleanup_error {
-                        Some(cleanup_error) => format!(
-                            "metric object-store publish failed: {error}; failed to clean local parts: {cleanup_error}"
-                        ),
-                        None => match rollback_error {
-                            Some(rollback_error) => format!(
-                                "metric object-store publish failed: {error}; rollback failed: {rollback_error}"
-                            ),
-                            None => format!("metric object-store publish failed: {error}"),
                         },
                     });
                 }

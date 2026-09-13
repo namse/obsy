@@ -199,8 +199,7 @@ impl RestartSafeBreakdown {
         let restarted = seen
             .iter()
             .any(|(label, value)| *value < self.current.get(label).copied().unwrap_or(0))
-            || (!self.current.is_empty()
-                && seen.is_empty());
+            || (!self.current.is_empty() && seen.is_empty());
         if restarted {
             for (label, value) in std::mem::take(&mut self.current) {
                 *self.banked.entry(label).or_default() += value;
@@ -370,7 +369,10 @@ async fn run_metric_verify(cfg: Config) {
         std::process::exit(1);
     }
     if let Err(error) = wait_for_collector(&cfg).await {
-        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        eprintln!(
+            "collector at {} is not answering: {error}",
+            cfg.push_address()
+        );
         std::process::exit(1);
     }
     let memory_source = cfg.memory_source();
@@ -575,7 +577,10 @@ async fn run_verify(cfg: Config) {
         std::process::exit(1);
     }
     if let Err(error) = wait_for_collector(&cfg).await {
-        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        eprintln!(
+            "collector at {} is not answering: {error}",
+            cfg.push_address()
+        );
         std::process::exit(1);
     }
     let memory_source = cfg.memory_source();
@@ -731,7 +736,10 @@ async fn run_load(cfg: Config) {
         std::process::exit(1);
     }
     if let Err(error) = wait_for_collector(&cfg).await {
-        eprintln!("collector at {} is not answering: {error}", cfg.push_address());
+        eprintln!(
+            "collector at {} is not answering: {error}",
+            cfg.push_address()
+        );
         std::process::exit(1);
     }
     let tenants: Vec<&str> = corpus.tenant_ids.iter().map(|id| id.as_str()).collect();
@@ -1692,9 +1700,9 @@ async fn verify_trace(
         }
         Ok(response) => {
             outcome.unexpected_status += 1;
-            outcome.first_verify_error.get_or_insert_with(|| {
-                format!("the timeline route answered {}", response.status)
-            });
+            outcome
+                .first_verify_error
+                .get_or_insert_with(|| format!("the timeline route answered {}", response.status));
             TraceProbe::Done
         }
         // The read address did not answer. A soak stops the engine on purpose,
@@ -1740,9 +1748,9 @@ async fn search_traces(
         }
         Ok(response) => {
             outcome.search_empty += 1;
-            outcome.first_verify_error.get_or_insert_with(|| {
-                format!("the trace search answered {}", response.status)
-            });
+            outcome
+                .first_verify_error
+                .get_or_insert_with(|| format!("the trace search answered {}", response.status));
         }
         Err(error) => {
             outcome.search_empty += 1;

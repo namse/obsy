@@ -22,12 +22,15 @@ string mean "disabled" and are valid only for knobs that can be disabled.
 | `SIGNY_OBJECT_STORE_URL` | unset (local-only) | `s3://bucket/prefix` or `file:///path`. **When unset, only the local disk is used without S3 tiering** — unsuitable for production because the disk becomes the source of truth |
 | `SIGNY_LISTEN_ADDR` | `127.0.0.1:3100` | The one listener: the collect route, the query API, the admin API and `/metrics`. **Loopback by default**: there is no TLS and no authentication here, so reaching this listener from off the machine has to be a decision rather than the result of not making one. A container that receives traffic sets this to `0.0.0.0:3100`. There is no second address any more — `SIGNY_OTLP_GRPC_ADDR` went with the OTLP gRPC services |
 
-`file://` is for **single-process development and does not provide CAS**. Using it on shared or network
-storage causes manifest lost updates, which means data loss. `from_url` logs a warning at startup.
+`file://` is for **single-process development and does not provide conditional catalog creation**. Using it
+on shared or network storage can lose catalog generations, which means data loss. `from_url` logs a warning
+at startup.
 
 Credentials and endpoints passed to `object_store` are supplied through `AWS_*` or `OBJECT_STORE_*`
 environment variables (`OBJECT_STORE_*` takes precedence). For S3-compatible stores,
-**`OBJECT_STORE_CONDITIONAL_PUT=etag` is effectively required**; without it, the startup preflight refuses to run.
+**`OBJECT_STORE_CONDITIONAL_PUT=etag` and `SIGNY_OBJECT_STORE_CATALOG_LOCKED=true` are effectively required**;
+the first enables conditional catalog creation and the second asserts that an R2 Bucket Lock rule covers the
+`catalog/` prefix. Without either, startup refuses to run.
 
 ## Multi-tenancy
 

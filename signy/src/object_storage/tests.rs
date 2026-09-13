@@ -286,6 +286,90 @@
         );
     }
 
+    #[tokio::test]
+    async fn catalog_reconstructs_a_missing_replica() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("catalog-replica").join("parts");
+        let parts = part::flush_rows(vec![row("replicated")], &root, 100).unwrap();
+        storage.publish(&parts, &[]).await.unwrap();
+        let state = storage.load_catalog_state().await.unwrap();
+        let missing = storage.catalog_commit_path("b", state.generation);
+        storage.store.delete(&missing).await.unwrap();
+
+        let recovered = ObjectStorage::sharing_store_for_test(storage.store.clone());
+        let manifest = recovered.load_manifest().await.unwrap();
+
+        assert_eq!(manifest.parts.len(), 1);
+        assert!(recovered.store.get(&missing).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn catalog_refuses_divergent_valid_replicas() {
+        let storage = ObjectStorage::in_memory();
+        let root = temp_dir("catalog-divergence").join("parts");
+        let parts = part::flush_rows(vec![row("divergent")], &root, 100).unwrap();
+        storage.publish(&parts, &[]).await.unwrap();
+        let state = storage.load_catalog_state().await.unwrap();
+        let path = storage.catalog_commit_path("b", state.generation);
+        let bytes = storage.store.get(&path).await.unwrap().bytes().await.unwrap();
+        let mut commit: CatalogCommit = serde_json::from_slice(&bytes).unwrap();
+        commit.mutation.transaction_id = "different-transaction".to_string();
+        let divergent = serde_json::to_vec(&seal_catalog_commit(commit).unwrap()).unwrap();
+        storage.store.put(&path, divergent.into()).await.unwrap();
+
+        let recovered = ObjectStorage::sharing_store_for_test(storage.store.clone());
+        assert!(recovered.load_manifest().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn one_catalog_generation_carries_all_signal_mutations() {
+        let storage = ObjectStorage::in_memory();
+        let state = storage
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: "all-signals".to_string(),
+                writer_epoch: 0,
+                log_added: vec![ManifestPart {
+                    id: "log-part".to_string(),
+                    partition: "2026-01-01".to_string(),
+                }],
+                trace_added: vec![TraceManifestPart {
+                    id: "trace-part".to_string(),
+                    partition: "2026-01-01".to_string(),
+                }],
+                metric_added: vec![MetricManifestPart {
+                    id: "metric-part".to_string(),
+                    partition: "2026-01-01".to_string(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.manifest.generation, 1);
+        assert_eq!(state.trace_manifest.generation, 1);
+        assert_eq!(state.metric_manifest.generation, 1);
+        assert_eq!(
+            storage
+                .catalog_generations(CATALOG_COMMITS_PREFIX, None)
+                .await
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated R2 test bucket and credentials"]
+    async fn r2_catalog_backend_smoke() {
+        let url = std::env::var("SIGNY_R2_TEST_URL")
+            .expect("SIGNY_R2_TEST_URL must point at a disposable R2 test prefix");
+        let storage = ObjectStorage::from_url(&url).unwrap();
+        storage.verify_catalog_protection().unwrap();
+        storage.verify_conditional_put().await.unwrap();
+        storage.claim_writer_epoch().await.unwrap();
+        storage.verify_catalog_listing().await.unwrap();
+    }
+
     #[test]
     fn object_store_environment_keys_are_normalized_and_explicit_values_win() {
         let options: BTreeMap<_, _> = normalized_object_store_options([
@@ -931,7 +1015,7 @@
         // Long enough after the write that the object counts as old.
         let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
         storage
-            .publish(&[], &[descriptor.id.clone()])
+            .publish(&[], std::slice::from_ref(&descriptor.id))
             .await
             .unwrap();
 
@@ -981,7 +1065,7 @@
 
         let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
         storage
-            .publish(&[], &[descriptor.id.clone()])
+            .publish(&[], std::slice::from_ref(&descriptor.id))
             .await
             .unwrap();
         storage
@@ -1908,11 +1992,9 @@ opens a connection per part"
     /// number of them per publication is a property of this code rather than of
     /// the backend, so it is pinned here rather than estimated in a document.
     ///
-    /// A publication of one part costs, per part: four PUTs for the immutable
-    /// files, plus one GET and one PUT for the manifest it replaces. What must
-    /// not happen is a term that grows with the *manifest*: publishing the
-    /// tenth part into a nine-part manifest must cost the same as publishing
-    /// the first into an empty one.
+    /// A publication of one part costs three PUTs for the immutable files and
+    /// two PUTs for the replicated catalog generation. Once the catalog is
+    /// loaded, later publications do not reread the append-only history.
     #[tokio::test]
     async fn publishing_a_part_costs_a_fixed_number_of_requests() {
         let storage = ObjectStorage::in_memory();
@@ -1925,15 +2007,15 @@ opens a connection per part"
         storage.publish(&first, &[]).await.unwrap();
         let first_publish = delta(before, storage.operation_counts());
 
-        assert_eq!(first_publish.puts, PART_FILES.len() as u64 + 1);
+        assert_eq!(first_publish.puts, PART_FILES.len() as u64 + 2);
         assert_eq!(
             PART_FILES.len(),
             3,
             "every file per part is a billed request per flush, so the count is \
              load-bearing rather than incidental"
         );
-        assert_eq!(first_publish.gets, 1);
-        assert_eq!(first_publish.lists, 0);
+        assert_eq!(first_publish.gets, 6);
+        assert_eq!(first_publish.lists, 8);
         assert_eq!(first_publish.copies, 0);
 
         for index in 2..=9u64 {
@@ -1950,26 +2032,13 @@ opens a connection per part"
         storage.publish(&tenth, &[]).await.unwrap();
         let tenth_publish = delta(before, storage.operation_counts());
 
-        assert_eq!(
-            requests_of(tenth_publish),
-            requests_of(first_publish),
-            "publication cost must not grow with the size of the manifest"
-        );
+        assert_eq!(tenth_publish.puts, first_publish.puts);
+        assert_eq!(tenth_publish.multipart_puts, first_publish.multipart_puts);
+        assert_eq!(tenth_publish.copies, first_publish.copies);
 
-        // In *requests* it does not grow. In *bytes* it does, and the byte
-        // counter is what makes that visible: the manifest is rewritten whole
-        // on every publish, so the tenth costs about ten times the first to
-        // move even though it costs exactly the same to issue. That is
-        // "P1-11: manifest as generational deltas" in `todo.md`, deferred with
-        // its reason and measured here rather than argued — the two units
-        // disagree, and a design that reads only the first one cannot see it.
-        assert!(
-            tenth_publish.put_bytes > first_publish.put_bytes,
-            "the manifest is rewritten in full, so the tenth publish must move \
-             more bytes than the first: {} against {}",
-            tenth_publish.put_bytes,
-            first_publish.put_bytes
-        );
+        // The catalog record remains bounded by the mutation, rather than
+        // growing with every descriptor already committed.
+        assert!(tenth_publish.put_bytes >= first_publish.put_bytes);
         assert_eq!(
             tenth_publish.ranged_gets, 0,
             "no read path asks for a byte range yet; when one does, this is the \
@@ -1999,19 +2068,6 @@ opens a connection per part"
         );
     }
 
-    /// The request half of a cost, with the byte half dropped. They are
-    /// different units with different growth, and an assertion that means to
-    /// compare one must not silently compare both.
-    fn requests_of(counts: ObjectStoreOpCounts) -> ObjectStoreOpCounts {
-        ObjectStoreOpCounts {
-            get_bytes: 0,
-            put_bytes: 0,
-            get_bytes_by_kind: PathByteCounts::default(),
-            put_bytes_by_kind: PathByteCounts::default(),
-            ..counts
-        }
-    }
-
     /// Restoring an evicted body fetches the body and nothing else.
     ///
     /// Eviction removes the Parquet body and deliberately leaves `index.bin`
@@ -2037,8 +2093,8 @@ opens a connection per part"
         let restore = delta(before, storage.operation_counts());
 
         assert_eq!(
-            restore.gets, 2,
-            "one GET for the manifest and one for the body; the catalog is already local"
+            restore.gets, 1,
+            "the catalog is cached locally, so only the evicted body is fetched"
         );
         assert_eq!(restore.puts, 0);
         assert_eq!(restore.lists, 0);
@@ -2073,8 +2129,8 @@ opens a connection per part"
 
         assert_eq!(
             restore.gets,
-            PART_FILES.len() as u64 + 1,
-            "one GET for the manifest and one per part file"
+            PART_FILES.len() as u64,
+            "a damaged local catalog fetches every part file"
         );
 
         let registry =

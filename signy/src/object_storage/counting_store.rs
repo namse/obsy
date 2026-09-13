@@ -103,7 +103,7 @@ pub struct PathByteCounts {
 /// differs by domain when what it varies with is the commit rate.
 fn classify(location: &Path) -> ObjectClass {
     let key = location.as_ref();
-    if key.ends_with("manifest.json") {
+    if key.ends_with("manifest.json") || key.contains("/catalog/") || key.starts_with("catalog/") {
         ObjectClass::Manifest
     } else if key.contains("/parts/") || key.starts_with("parts/") {
         ObjectClass::Part
@@ -257,6 +257,23 @@ impl ObjectStore for CountingStore {
         let ops = self.ops.clone();
         self.inner
             .list(prefix)
+            .inspect(move |item| {
+                if item.is_ok() {
+                    ops.listed_objects.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.ops.lists.fetch_add(1, Ordering::Relaxed);
+        let ops = self.ops.clone();
+        self.inner
+            .list_with_offset(prefix, offset)
             .inspect(move |item| {
                 if item.is_ok() {
                     ops.listed_objects.fetch_add(1, Ordering::Relaxed);

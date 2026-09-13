@@ -14,6 +14,7 @@
 //! The same no-new-dependency shim style as `malloc_tuning`: one libc call,
 //! declared here, compiled out on non-Linux.
 
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::Path;
 

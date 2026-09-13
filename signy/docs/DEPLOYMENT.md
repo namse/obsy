@@ -18,10 +18,13 @@ part in between: how to get from nothing to a process that is running.
 The object store is where the data actually lives. The local disk is a cache
 plus a WAL that has not been flushed yet.
 
-**Create the bucket and turn on object versioning.** One manifest object holds
-the complete part list; every part can survive and the catalog will still be
-gone if that object is lost. Versioning is what makes that recoverable, and it
-is not something the engine can do for you.
+**Create the bucket and protect the catalog prefix with R2 Bucket Lock.** Signy
+does not depend on the S3 bucket-versioning API, which R2 does not implement.
+Each catalog commit is an append-only object with two fixed replicas under
+`catalog/commits/a/` and `catalog/commits/b/`; periodic snapshots use the same
+layout. Configure a Bucket Lock rule covering the deployment's `catalog/`
+prefix with a retention period that covers the service's recovery and audit
+requirements. Signy never garbage-collects catalog history in this format.
 
 **Create an API token** scoped to that one bucket, with read and write. R2
 tokens come with an access key id and secret in the S3 shape, which is what
@@ -32,18 +35,34 @@ SIGNY_OBJECT_STORE_URL=s3://your-bucket/signy
 OBJECT_STORE_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 OBJECT_STORE_REGION=auto
 OBJECT_STORE_CONDITIONAL_PUT=etag
+SIGNY_OBJECT_STORE_CATALOG_LOCKED=true
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 ```
 
-`OBJECT_STORE_CONDITIONAL_PUT=etag` is not optional. Every commit is a
-compare-and-swap on the manifest, and without conditional writes two commits
-silently overwrite each other, which is data loss rather than an error. Startup
-runs a preflight that writes a probe object and checks **that a write which
-should be rejected is rejected**, and refuses to start otherwise — so if the
-process comes up at all, conditional writes work on your provider. That check
-is the only place this question can be answered, because it is the deployment
-target itself answering it.
+`OBJECT_STORE_CONDITIONAL_PUT=etag` is not optional. A commit first creates a
+generation object and then creates its identical replica; without conditional
+writes two writers can publish the same generation and diverge. Startup runs a
+preflight that writes a probe object and checks **that writes which should be
+rejected are rejected**, and refuses to start otherwise — so if the process
+comes up at all, conditional writes work on your provider. That check is the
+only place this question can be answered, because it is the deployment target
+itself answering it.
+
+The journal layout is intentionally fail-closed. If `manifest.json`,
+`trace-manifest.json`, or `metric-manifest.json` from an older Signy version is
+present, startup stops and asks for an explicit migration; it will not interpret
+that mutable state as an empty catalog.
+
+Before production, run the ignored R2 smoke test against a disposable prefix
+with the same endpoint, credentials, conditional-write setting, and Bucket Lock
+rule:
+
+```
+SIGNY_R2_TEST_URL=s3://your-bucket/signy-r2-smoke \
+SIGNY_OBJECT_STORE_CATALOG_LOCKED=true \
+cargo test --manifest-path signy/Cargo.toml --lib r2_catalog_backend_smoke -- --ignored
+```
 
 ## 2. The disk
 

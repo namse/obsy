@@ -127,13 +127,14 @@ Ingest continues until the backlog limit, then returns 429 to clients.
 During startup, it retries for `SIGNY_STARTUP_RETRY_BUDGET` (5 minutes by default) and then exits.
 If it looks like a crash loop, fix the store rather than increasing that budget.
 
-### Startup is rejected with a "conditional writes" error
+### Startup is rejected with a catalog protection or "conditional writes" error
 
-The preflight detected **a store that does not enforce conditional writes**. Running it as-is causes manifest
-lost updates, which means data loss.
+The preflight detected **a store that does not enforce conditional writes**. Running it as-is allows catalog
+generation collisions, which means data loss.
 
-For an S3-compatible store, set `OBJECT_STORE_CONDITIONAL_PUT=etag`. For a single-process development
-store, use a `file://` URL — it intentionally gives up CAS.
+For an S3-compatible store, set `OBJECT_STORE_CONDITIONAL_PUT=etag` and configure an R2 Bucket Lock rule for
+the `catalog/` prefix, then set `SIGNY_OBJECT_STORE_CATALOG_LOCKED=true`. For a single-process development
+store, use a `file://` URL — it intentionally gives up conditional writes and catalog protection.
 
 ### Disk is full
 
@@ -263,7 +264,8 @@ removes the duplicates yet — that is deduplication, still open in `todo.md`.
 
 S3 is the source of truth. The local disk is the cache plus the unflushed WAL.
 
-- Configure object-store versioning/replication policy **in the store**. The engine does not manage it.
-- One manifest object contains the complete part list. If it is lost, the catalog disappears even when part
-  objects remain. **Versioning is strongly recommended.**
+- Configure R2 Bucket Lock for the `catalog/` prefix and keep the two catalog replicas in the same bucket.
+  The engine does not delete catalog history in this format.
+- Catalog generations are append-only and each is stored twice with a digest. Loss of both replicas or the
+  entire bucket is outside the recovery guarantee; a single missing or invalid replica is repaired from the other.
 - Backing up the local disk is not meaningful — it contains either cache data or data that is not yet durable.

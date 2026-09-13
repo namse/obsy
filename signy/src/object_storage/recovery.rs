@@ -22,12 +22,14 @@ pub(crate) fn write_flush_transaction(
 pub(crate) fn clear_flush_transaction(data_dir: &Path) -> Result<(), String> {
     let path = data_dir.join(FLUSH_TRANSACTION_FILE);
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(format!("refusing symlinked flush transaction {}", path.display()))
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            Err(format!("flush transaction is not a file: {}", path.display()))
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing symlinked flush transaction {}",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "flush transaction is not a file: {}",
+            path.display()
+        )),
         Ok(_) => {
             std::fs::remove_file(&path).map_err(|error| error.to_string())?;
             part::fsync_dir(data_dir).map_err(|error| error.to_string())
@@ -77,17 +79,52 @@ impl ObjectStorage {
         data_dir: &Path,
         transaction: &FlushTransaction,
     ) -> Result<(), String> {
-
         let log_ids: Vec<String> = transaction
             .log_parts
             .iter()
             .map(|part| part.id.clone())
             .collect();
-        self.publish(&[], &log_ids).await?;
-        self.remove_trace_parts(&transaction.trace_parts).await?;
-        self.remove_metric_parts(&transaction.metric_parts).await?;
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let trace_ids: Vec<String> = transaction
+            .trace_parts
+            .iter()
+            .map(|part| part.id.clone())
+            .collect();
+        let metric_ids: Vec<String> = transaction
+            .metric_parts
+            .iter()
+            .map(|part| part.id.clone())
+            .collect();
+        let has_removed = state
+            .manifest
+            .parts
+            .iter()
+            .any(|part| log_ids.iter().any(|id| id == &part.id))
+            || state
+                .trace_manifest
+                .parts
+                .iter()
+                .any(|part| trace_ids.iter().any(|id| id == &part.id))
+            || state
+                .metric_manifest
+                .parts
+                .iter()
+                .any(|part| metric_ids.iter().any(|id| id == &part.id));
+        if has_removed {
+            self.commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                log_removed: log_ids,
+                trace_removed: trace_ids,
+                metric_removed: metric_ids,
+                ..Default::default()
+            })
+            .await?;
+        }
         self.delete_part_objects(&transaction.log_parts).await?;
-        self.delete_trace_part_objects(&transaction.trace_parts).await?;
+        self.delete_trace_part_objects(&transaction.trace_parts)
+            .await?;
         self.delete_metric_part_objects(&transaction.metric_parts)
             .await?;
 

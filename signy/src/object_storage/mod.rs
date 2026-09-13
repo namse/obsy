@@ -9,8 +9,8 @@ use object_store::{
     GetOptions, GetRange, MultipartUpload, ObjectStore, PutMode, PutOptions, PutResult,
     UpdateVersion,
 };
-use tokio::io::AsyncReadExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::part::{self, DATA_FILE, INDEX_FILE, META_FILE, Part};
 use crate::series_part::{
@@ -100,8 +100,11 @@ impl StagingDir {
         let attempt = RESTORE_STAGING_SEQUENCE
             .fetch_add(1, Ordering::Relaxed)
             .to_string();
-        let dir =
-            ensure_safe_directory_chain(cache_root, &[".tmp", "remote", &attempt, partition, id], true)?;
+        let dir = ensure_safe_directory_chain(
+            cache_root,
+            &[".tmp", "remote", &attempt, partition, id],
+            true,
+        )?;
         let root = dir
             .parent()
             .and_then(Path::parent)
@@ -190,7 +193,7 @@ impl From<&Part> for ManifestPart {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub generation: u64,
     /// Which writer owns this prefix. Carried in the manifest rather than in
@@ -210,7 +213,7 @@ pub struct TraceManifestPart {
     pub partition: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TraceManifest {
     pub generation: u64,
     #[serde(default)]
@@ -233,7 +236,7 @@ impl From<&SeriesPart> for MetricManifestPart {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MetricManifest {
     pub generation: u64,
     #[serde(default)]
@@ -242,8 +245,8 @@ pub struct MetricManifest {
 }
 
 /// Durable intent for the cross-domain flush boundary. The journal
-/// checkpoint is the commit record: before it advances, startup removes both
-/// manifest additions; after it advances, startup only clears this intent.
+/// checkpoint is the commit record: before it advances, startup removes all
+/// catalog additions; after it advances, startup only clears this intent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FlushTransaction {
     pub offset: u64,
@@ -253,11 +256,6 @@ pub(crate) struct FlushTransaction {
     /// parses — an empty list is exactly what that transaction meant.
     #[serde(default)]
     pub metric_parts: Vec<MetricManifestPart>,
-}
-
-struct LoadedManifest {
-    manifest: Manifest,
-    version: Option<UpdateVersion>,
 }
 
 struct LocalMergeGroup {
@@ -271,6 +269,7 @@ mod fault_store;
 pub use counting_store::{CountingStore, ObjectStoreOpCounts, ObjectStoreOps, PathByteCounts};
 
 include!("paths.rs");
+include!("journal.rs");
 include!("catalog.rs");
 include!("object_io.rs");
 include!("cache.rs");

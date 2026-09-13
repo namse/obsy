@@ -1,4 +1,4 @@
-/// Immutable part objects plus a compare-and-swap manifest.
+/// Immutable part objects plus an append-only, replicated catalog journal.
 ///
 /// `prefix` is the path component of SIGNY_OBJECT_STORE_URL. Credentials
 /// and endpoint settings are consumed by object_store from the process
@@ -10,6 +10,7 @@ pub struct ObjectStorage {
     ops: Arc<ObjectStoreOps>,
     prefix: ObjectPath,
     manifest_update: tokio::sync::Mutex<()>,
+    catalog_state: tokio::sync::Mutex<Option<CatalogState>>,
     /// The local filesystem backend does not implement conditional updates.
     /// It is only exposed as a single-process development backend, where the
     /// process-local mutex plus LocalFileSystem's staged rename gives us an
@@ -20,13 +21,13 @@ pub struct ObjectStorage {
     /// Held here rather than returned to each caller so that every writer —
     /// flush, merge, retention, the final force-flush — reacts identically
     /// without any of them having to know what fencing is. They all see an
-    /// ordinary manifest error; the drain has already begun by then.
+    /// ordinary catalog error; the drain has already begun by then.
     fence_sink: std::sync::OnceLock<Arc<crate::shutdown::ShutdownState>>,
     /// This instance's claim on the prefix, or 0 while unclaimed.
     ///
     /// The architecture assumes one writer; nothing used to enforce it, so two
-    /// processes on the same prefix each believed they owned it. The manifest
-    /// CAS stops a lost update but not two divergent local WALs, and not one
+    /// processes on the same prefix each believed they owned it. The catalog
+    /// generation create stops a lost update but not two divergent local WALs, and not one
     /// instance's retention expiring a part the other has just registered.
     writer_epoch: AtomicU64,
     /// Catalog files checksummed while restoring. The expensive part of a
@@ -110,11 +111,11 @@ impl RemoteCache {
     }
 
     pub fn record_remote_failure(&self) {
-        let _ = self
-            .remote_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |failures| {
-                Some(failures.saturating_add(1))
-            });
+        let _ =
+            self.remote_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |failures| {
+                    Some(failures.saturating_add(1))
+                });
     }
 
     pub fn mark_cache_healthy(&self) {
@@ -164,7 +165,6 @@ impl ObjectStorage {
     #[cfg(not(test))]
     fn record_catalog_validation(&self) {}
 
-
     pub fn from_url(url: &str) -> Result<Self, String> {
         let url =
             url::Url::parse(url).map_err(|error| format!("invalid object-store URL: {error}"))?;
@@ -172,9 +172,9 @@ impl ObjectStorage {
         if local_manifest_overwrite {
             tracing::warn!(
                 %url,
-                "object store is a local filesystem path: manifest updates use overwrite instead \
-of compare-and-swap and are only safe for a single process on a local disk. Do not use this for \
-production or on shared/network storage."
+                "object store is a local filesystem path: catalog updates use overwrite instead \
+            of compare-and-swap and are only safe for a single process on a local disk. Do not use this for \
+            production or on shared/network storage."
             );
         }
         let options = normalized_object_store_options(std::env::vars());
@@ -184,7 +184,10 @@ production or on shared/network storage."
         // injection only when the load knobs are present. Absent the knobs this
         // is a no-op and the object-store construction path is unchanged.
         let store: Arc<dyn ObjectStore> = match fault_store::FaultConfig::from_env()? {
-            Some(config) => Arc::new(fault_store::LatencyFaultStore::new(Arc::from(store), config)),
+            Some(config) => Arc::new(fault_store::LatencyFaultStore::new(
+                Arc::from(store),
+                config,
+            )),
             None => Arc::from(store),
         };
         Ok(Self::wrapping(store, prefix, local_manifest_overwrite))
@@ -203,6 +206,7 @@ production or on shared/network storage."
             ops,
             prefix,
             manifest_update: tokio::sync::Mutex::new(()),
+            catalog_state: tokio::sync::Mutex::new(None),
             local_manifest_overwrite,
             fence_sink: std::sync::OnceLock::new(),
             writer_epoch: AtomicU64::new(0),
@@ -229,11 +233,7 @@ production or on shared/network storage."
     /// same prefix actually look like.
     #[cfg(test)]
     pub fn sharing_store_for_test(store: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self::wrapping(
-            store,
-            ObjectPath::from("signy-test"),
-            false,
-        ))
+        Arc::new(Self::wrapping(store, ObjectPath::from("signy-test"), false))
     }
 
     /// An in-memory store whose every write fails, for the paths that must
@@ -301,33 +301,8 @@ production or on shared/network storage."
         ))
     }
 
-    async fn load_manifest_versioned(&self) -> Result<LoadedManifest, String> {
-        let path = self.manifest_path();
-        match self.store.get(&path).await {
-            Ok(result) => {
-                let version = Some(UpdateVersion {
-                    e_tag: result.meta.e_tag.clone(),
-                    version: result.meta.version.clone(),
-                });
-                let bytes = result
-                    .bytes()
-                    .await
-                    .map_err(|error| format!("failed to read manifest body: {error}"))?;
-                let manifest: Manifest = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("invalid object-store manifest: {error}"))?;
-                validate_manifest(&manifest)?;
-                Ok(LoadedManifest { manifest, version })
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(LoadedManifest {
-                manifest: Manifest::default(),
-                version: None,
-            }),
-            Err(error) => Err(format!("failed to load object-store manifest: {error}")),
-        }
-    }
-
     pub async fn load_manifest(&self) -> Result<Manifest, String> {
-        Ok(self.load_manifest_versioned().await?.manifest)
+        Ok(self.load_catalog_state().await?.manifest)
     }
 
     /// Refuse to start when the configured store does not actually enforce
@@ -343,7 +318,7 @@ production or on shared/network storage."
     /// fencing — silently rests on nothing.
     ///
     /// The check is the *negative* path. A positive one proves nothing: the
-    /// first manifest write of a fresh prefix succeeds whether or not the
+    /// first catalog write of a fresh prefix succeeds whether or not the
     /// condition was honoured. What must hold is that a write which should be
     /// rejected **is** rejected.
     pub async fn verify_conditional_put(&self) -> Result<(), String> {
@@ -378,6 +353,25 @@ production or on shared/network storage."
         outcome
     }
 
+    pub fn verify_catalog_protection(&self) -> Result<(), String> {
+        if self.local_manifest_overwrite {
+            return Ok(());
+        }
+        let configured = std::env::var("SIGNY_OBJECT_STORE_CATALOG_LOCKED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false);
+        if configured {
+            Ok(())
+        } else {
+            Err("catalog protection is not asserted; configure an R2 Bucket Lock rule for the catalog/ prefix and set SIGNY_OBJECT_STORE_CATALOG_LOCKED=true".to_string())
+        }
+    }
+
     async fn probe_rejections(&self, probe: &ObjectPath, created: PutResult) -> Result<(), String> {
         let recreated = self
             .store
@@ -397,7 +391,7 @@ production or on shared/network storage."
         }
 
         // A version that was valid and no longer is: exactly the shape of the
-        // lost update the manifest CAS exists to prevent.
+        // lost update the catalog generation create exists to prevent.
         let stale = UpdateVersion {
             e_tag: created.e_tag.clone(),
             version: created.version.clone(),
@@ -440,7 +434,7 @@ production or on shared/network storage."
     fn preflight_failure(what_happened: &str) -> String {
         format!(
             "the configured object store does not enforce conditional writes: {what_happened}. \
-Every manifest guarantee in this engine depends on compare-and-swap, so refusing to start is the \
+Every catalog guarantee in this engine depends on conditional object creation, so refusing to start is the \
 only safe response. For S3-compatible stores set OBJECT_STORE_CONDITIONAL_PUT=etag; for a local \
 single-process development store use a file:// URL, which opts out of CAS deliberately."
         )
@@ -457,145 +451,37 @@ single-process development store use a file:// URL, which opts out of CAS delibe
 
     /// Take ownership of the prefix, and report the epoch taken.
     ///
-    /// Called once at startup, before any worker runs. Both manifests carry
-    /// the same number so that whichever one a later write touches first
-    /// notices a takeover.
+    /// Called once at startup, before any worker runs. The catalog commit
+    /// carries the writer epoch for every signal in one logical generation.
     pub async fn claim_writer_epoch(&self) -> Result<u64, String> {
-        let mut claimed = None;
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let loaded = self.load_manifest_versioned().await?;
-            let epoch = loaded
-                .manifest
-                .writer_epoch
-                .checked_add(1)
-                .ok_or_else(|| "writer epoch overflow".to_string())?;
-            let mut next = loaded.manifest.clone();
-            next.writer_epoch = epoch;
-            next.generation = next
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "manifest generation overflow".to_string())?;
-            if self
-                .try_put_manifest(&next, loaded.version, self.manifest_path())
-                .await?
-            {
-                claimed = Some(epoch);
-                break;
-            }
-        }
-        let Some(epoch) = claimed else {
-            return Err("writer epoch claim CAS retry limit exceeded".to_string());
-        };
-
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let (loaded, version) = self.load_trace_manifest_versioned().await?;
-            let mut next = loaded.clone();
-            next.writer_epoch = epoch;
-            next.generation = next
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "trace manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode trace manifest: {error}"))?;
-            let mode = self.put_mode(version);
-            match self
-                .store
-                .put_opts(
-                    &self.trace_manifest_path(),
-                    body.into(),
-                    PutOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => {
-                    self.claim_metric_writer_epoch(epoch).await?;
-                    // Published only once all three manifests agree: a
-                    // half-claimed prefix would fence this instance off its
-                    // own trace or metric writes.
-                    self.writer_epoch.store(epoch, Ordering::Release);
-                    tracing::info!(epoch, "claimed the object-store writer epoch");
-                    return Ok(epoch);
-                }
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to claim the trace manifest: {error}")),
-            }
-        }
-        Err("trace writer epoch claim CAS retry limit exceeded".to_string())
+        let state = self.load_catalog_state().await?;
+        let epoch = state
+            .writer_epoch
+            .checked_add(1)
+            .ok_or_else(|| "writer epoch overflow".to_string())?;
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: epoch,
+                claim_writer: true,
+                ..Default::default()
+            })
+            .await?;
+        self.writer_epoch
+            .store(next.writer_epoch, Ordering::Release);
+        tracing::info!(
+            epoch = next.writer_epoch,
+            "claimed the object-store writer epoch"
+        );
+        Ok(next.writer_epoch)
     }
 
-    /// The metric half of the claim, run after the other two manifests carry
-    /// the epoch. Split from `claim_writer_epoch` only so the publish order in
-    /// that function stays readable; a caller always runs both.
-    async fn claim_metric_writer_epoch(&self, epoch: u64) -> Result<(), String> {
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let (loaded, version) = self.load_metric_manifest_versioned().await?;
-            let mut next = loaded.clone();
-            next.writer_epoch = epoch;
-            next.generation = next
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "metric manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode metric manifest: {error}"))?;
-            let mode = self.put_mode(version);
-            match self
-                .store
-                .put_opts(
-                    &self.metric_manifest_path(),
-                    body.into(),
-                    PutOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to claim the metric manifest: {error}")),
-            }
-        }
-        Err("metric writer epoch claim CAS retry limit exceeded".to_string())
-    }
-
+    #[cfg(test)]
     fn put_mode(&self, version: Option<UpdateVersion>) -> PutMode {
         match version {
             Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
             Some(version) => PutMode::Update(version),
             None => PutMode::Create,
-        }
-    }
-
-    async fn try_put_manifest(
-        &self,
-        manifest: &Manifest,
-        version: Option<UpdateVersion>,
-        path: ObjectPath,
-    ) -> Result<bool, String> {
-        let body = serde_json::to_vec_pretty(manifest)
-            .map_err(|error| format!("failed to encode manifest: {error}"))?;
-        let mode = self.put_mode(version);
-        match self
-            .store
-            .put_opts(
-                &path,
-                body.into(),
-                PutOptions {
-                    mode,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
-            Err(error) => Err(format!("failed to update manifest: {error}")),
         }
     }
 
@@ -617,33 +503,8 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         ))
     }
 
-    async fn load_trace_manifest_versioned(
-        &self,
-    ) -> Result<(TraceManifest, Option<UpdateVersion>), String> {
-        match self.store.get(&self.trace_manifest_path()).await {
-            Ok(result) => {
-                let version = Some(UpdateVersion {
-                    e_tag: result.meta.e_tag.clone(),
-                    version: result.meta.version.clone(),
-                });
-                let bytes = result
-                    .bytes()
-                    .await
-                    .map_err(|error| format!("failed to read trace manifest body: {error}"))?;
-                let manifest: TraceManifest = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("invalid trace object-store manifest: {error}"))?;
-                validate_trace_manifest(&manifest)?;
-                Ok((manifest, version))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok((TraceManifest::default(), None)),
-            Err(error) => Err(format!(
-                "failed to load trace object-store manifest: {error}"
-            )),
-        }
-    }
-
     pub async fn load_trace_manifest(&self) -> Result<TraceManifest, String> {
-        Ok(self.load_trace_manifest_versioned().await?.0)
+        Ok(self.load_catalog_state().await?.trace_manifest)
     }
 
     pub async fn publish_trace_parts(&self, added: &[TracePart]) -> Result<TraceManifest, String> {
@@ -656,63 +517,44 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             self.upload_trace_part(part).await?;
         }
 
-        let _guard = self.manifest_update.lock().await;
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let (loaded, version) = self.load_trace_manifest_versioned().await?;
-            self.check_epoch(loaded.writer_epoch)?;
-            let mut next = loaded.clone();
-            for part in added {
-                let descriptor = TraceManifestPart {
-                    id: part.meta.id.clone(),
-                    partition: part.meta.partition.clone(),
-                };
-                if let Some(existing) = next.parts.iter().find(|item| item.id == descriptor.id) {
-                    if existing != &descriptor {
-                        return Err(format!(
-                            "trace manifest part ID collision: {}",
-                            descriptor.id
-                        ));
-                    }
-                } else {
-                    next.parts.push(descriptor);
-                }
-            }
-            next.parts.sort_by(|left, right| {
-                (&left.partition, &left.id).cmp(&(&right.partition, &right.id))
-            });
-            if next.parts == loaded.parts {
-                return Ok(loaded);
-            }
-            next.generation = loaded
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "trace manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode trace manifest: {error}"))?;
-            let mode = match version {
-                Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
-                Some(version) => PutMode::Update(version),
-                None => PutMode::Create,
-            };
-            match self
-                .store
-                .put_opts(
-                    &self.trace_manifest_path(),
-                    body.into(),
-                    PutOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
-                .await
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let descriptors: Vec<TraceManifestPart> = added
+            .iter()
+            .map(|part| TraceManifestPart {
+                id: part.meta.id.clone(),
+                partition: part.meta.partition.clone(),
+            })
+            .collect();
+        for descriptor in &descriptors {
+            if let Some(existing) = state
+                .trace_manifest
+                .parts
+                .iter()
+                .find(|item| item.id == descriptor.id)
+                && existing != descriptor
             {
-                Ok(_) => return Ok(next),
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to update trace manifest: {error}")),
+                return Err(format!(
+                    "trace manifest part ID collision: {}",
+                    descriptor.id
+                ));
             }
         }
-        Err("trace manifest compare-and-swap retry limit exceeded".to_string())
+        if descriptors
+            .iter()
+            .all(|descriptor| state.trace_manifest.parts.contains(descriptor))
+        {
+            return Ok(state.trace_manifest);
+        }
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                trace_added: descriptors,
+                ..Default::default()
+            })
+            .await?;
+        Ok(next.trace_manifest)
     }
 
     /// Removes trace descriptors from the manifest using the same CAS
@@ -725,85 +567,31 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         if removed.is_empty() {
             return self.load_trace_manifest().await;
         }
-        let removed_ids: HashSet<&str> = removed.iter().map(|part| part.id.as_str()).collect();
-        let _guard = self.manifest_update.lock().await;
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let (loaded, version) = self.load_trace_manifest_versioned().await?;
-            self.check_epoch(loaded.writer_epoch)?;
-            let present = loaded
-                .parts
-                .iter()
-                .filter(|part| removed_ids.contains(part.id.as_str()))
-                .count();
-            // Removal is the only thing this writes, so it is idempotent per
-            // id: a batch that mixes ids an earlier tick already removed with
-            // ids that have only just expired removes what is left rather than
-            // failing, which is what keeps a retry from wedging forever.
-            if present == 0 {
-                return Ok(loaded);
-            }
-            let mut next = loaded.clone();
-            next.parts
-                .retain(|part| !removed_ids.contains(part.id.as_str()));
-            next.generation = loaded
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "trace manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode trace manifest: {error}"))?;
-            let mode = match version {
-                Some(_) if self.local_manifest_overwrite => PutMode::Overwrite,
-                Some(version) => PutMode::Update(version),
-                None => PutMode::Create,
-            };
-            match self
-                .store
-                .put_opts(
-                    &self.trace_manifest_path(),
-                    body.into(),
-                    PutOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => return Ok(next),
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to update trace manifest: {error}")),
-            }
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let removed_ids: Vec<String> = removed.iter().map(|part| part.id.clone()).collect();
+        let present = state
+            .trace_manifest
+            .parts
+            .iter()
+            .filter(|part| removed_ids.iter().any(|id| id == &part.id))
+            .count();
+        if present == 0 {
+            return Ok(state.trace_manifest);
         }
-        Err("trace manifest retention CAS retry limit exceeded".to_string())
-    }
-
-    async fn load_metric_manifest_versioned(
-        &self,
-    ) -> Result<(MetricManifest, Option<UpdateVersion>), String> {
-        match self.store.get(&self.metric_manifest_path()).await {
-            Ok(result) => {
-                let version = Some(UpdateVersion {
-                    e_tag: result.meta.e_tag.clone(),
-                    version: result.meta.version.clone(),
-                });
-                let bytes = result
-                    .bytes()
-                    .await
-                    .map_err(|error| format!("failed to read metric manifest body: {error}"))?;
-                let manifest: MetricManifest = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("invalid metric object-store manifest: {error}"))?;
-                validate_metric_manifest(&manifest)?;
-                Ok((manifest, version))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok((MetricManifest::default(), None)),
-            Err(error) => Err(format!(
-                "failed to load metric object-store manifest: {error}"
-            )),
-        }
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                trace_removed: removed_ids,
+                ..Default::default()
+            })
+            .await?;
+        Ok(next.trace_manifest)
     }
 
     pub async fn load_metric_manifest(&self) -> Result<MetricManifest, String> {
-        Ok(self.load_metric_manifest_versioned().await?.0)
+        Ok(self.load_catalog_state().await?.metric_manifest)
     }
 
     /// Uploads immutable metric part files, then atomically adds and removes
@@ -826,79 +614,63 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             self.upload_metric_part(part).await?;
         }
 
-        let _guard = self.manifest_update.lock().await;
-        for _ in 0..MAX_CAS_ATTEMPTS {
-            let (loaded, version) = self.load_metric_manifest_versioned().await?;
-            self.check_epoch(loaded.writer_epoch)?;
-            let removed_ids: HashSet<&str> = removed.iter().map(|part| part.id.as_str()).collect();
-            // The same replacement discipline as the log publish: a retry that
-            // observes its inputs already gone accepts only the exact
-            // idempotent end state, and a compaction whose inputs another
-            // writer touched is refused rather than reapplied.
-            if !removed_ids.is_empty() {
-                let present_removed = loaded
-                    .parts
-                    .iter()
-                    .filter(|part| removed_ids.contains(part.id.as_str()))
-                    .count();
-                let all_added_present = added.iter().all(|part| {
-                    let descriptor = MetricManifestPart::from(part);
-                    loaded.parts.iter().any(|existing| existing == &descriptor)
-                });
-                if present_removed == 0 && all_added_present {
-                    return Ok(loaded);
-                }
-                if !added.is_empty() && present_removed != removed_ids.len() {
-                    return Err(format!(
-                        "{INPUTS_CHANGED_ERROR}: expected {} input metric parts, found {present_removed}",
-                        removed_ids.len()
-                    ));
-                }
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let removed_ids: Vec<String> = removed.iter().map(|part| part.id.clone()).collect();
+        let descriptors: Vec<MetricManifestPart> =
+            added.iter().map(MetricManifestPart::from).collect();
+        if !removed_ids.is_empty() {
+            let present_removed = state
+                .metric_manifest
+                .parts
+                .iter()
+                .filter(|part| removed_ids.iter().any(|id| id == &part.id))
+                .count();
+            let all_added_present = descriptors
+                .iter()
+                .all(|descriptor| state.metric_manifest.parts.contains(descriptor));
+            if present_removed == 0 && all_added_present {
+                return Ok(state.metric_manifest);
             }
-            let mut next = loaded.clone();
-            next.parts
-                .retain(|part| !removed_ids.contains(part.id.as_str()));
-            for part in added.iter().map(MetricManifestPart::from) {
-                if let Some(existing) = next.parts.iter().find(|item| item.id == part.id) {
-                    if existing != &part {
-                        return Err(format!("metric manifest part ID collision: {}", part.id));
-                    }
-                } else {
-                    next.parts.push(part);
-                }
-            }
-            next.parts.sort_by(|left, right| {
-                (&left.partition, &left.id).cmp(&(&right.partition, &right.id))
-            });
-            if next.parts == loaded.parts {
-                return Ok(loaded);
-            }
-            next.generation = loaded
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "metric manifest generation overflow".to_string())?;
-            let body = serde_json::to_vec_pretty(&next)
-                .map_err(|error| format!("failed to encode metric manifest: {error}"))?;
-            let mode = self.put_mode(version);
-            match self
-                .store
-                .put_opts(
-                    &self.metric_manifest_path(),
-                    body.into(),
-                    PutOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => return Ok(next),
-                Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. }) => continue,
-                Err(error) => return Err(format!("failed to update metric manifest: {error}")),
+            if !descriptors.is_empty() && present_removed != removed_ids.len() {
+                return Err(format!(
+                    "{INPUTS_CHANGED_ERROR}: expected {} input metric parts, found {present_removed}",
+                    removed_ids.len()
+                ));
             }
         }
-        Err("metric manifest compare-and-swap retry limit exceeded".to_string())
+        for descriptor in &descriptors {
+            if let Some(existing) = state
+                .metric_manifest
+                .parts
+                .iter()
+                .find(|item| item.id == descriptor.id)
+                && existing != descriptor
+                && !removed_ids.iter().any(|id| id == &descriptor.id)
+            {
+                return Err(format!(
+                    "metric manifest part ID collision: {}",
+                    descriptor.id
+                ));
+            }
+        }
+        if removed_ids.is_empty()
+            && descriptors
+                .iter()
+                .all(|descriptor| state.metric_manifest.parts.contains(descriptor))
+        {
+            return Ok(state.metric_manifest);
+        }
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                metric_added: descriptors,
+                metric_removed: removed_ids,
+                ..Default::default()
+            })
+            .await?;
+        Ok(next.metric_manifest)
     }
 
     /// Removal alone, idempotent per id for the same reason the trace removal
@@ -1026,7 +798,9 @@ single-process development store use a file:// URL, which opts out of CAS delibe
     }
 
     fn delete_request_path(&self, tenant: &str, request_id: &str) -> ObjectPath {
-        self.path(&format!("{DELETE_REQUEST_PREFIX}/{tenant}/{request_id}.json"))
+        self.path(&format!(
+            "{DELETE_REQUEST_PREFIX}/{tenant}/{request_id}.json"
+        ))
     }
 
     /// One object per request, for the same reason as one object per policy: a
@@ -1256,5 +1030,4 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             .map_err(|error| format!("failed to store the orphan ledger: {error}"))?;
         Ok(())
     }
-
 }

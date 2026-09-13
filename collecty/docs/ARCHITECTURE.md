@@ -27,7 +27,7 @@ lives here. [`CONFIGURATION.md`](CONFIGURATION.md) is the knob-by-knob reference
 | Tenancy | **None for what it forwards.** The tenant travels inside the payload as the `tenant.id` resource attribute (obsy issue #9), so a collector that does not decode has nothing to do. Collecty-generated metrics and enabled host-source telemetry use `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` — see below |
 | Self-observation | `collecty_*` metrics and enabled host-source telemetry are encoded as OTLP and pushed through collecty's own queue, plus a periodic summary on stderr. `COLLECTY_GENERATED_TELEMETRY_TENANT_ID` names every export collecty builds; unset means none of those exports are built |
 | Format versioning | **None.** Nothing on disk is versioned. A queue written by another build is deleted, not migrated |
-| Transport security | **None, by design.** No TLS and no authentication on either hop, so **the bind address is the access control**: the default is loopback, and anything wider is expected to stay inside a trust boundary |
+| Transport security | The ingest listener is plain HTTP with no authentication and remains inside its trust boundary. The outbound hop supports HTTP for trusted private networks or HTTPS with normal certificate and hostname verification; optional Cloudflare Access service-token credentials are sent only on that hop |
 
 ## The property the whole design rests on
 
@@ -488,7 +488,7 @@ else does.
 - **Payload transformation.** No attribute injection, no filtering, no sampling.
   All of it requires decoding, and not decoding is the point.
 - **Tenancy.** See the decisions table.
-- **TLS.** See the decisions table.
+- **TLS on the ingest listener.** The input side remains plain HTTP; outbound TLS is provided for the signy hop.
 
 ## Where this depends on signy
 

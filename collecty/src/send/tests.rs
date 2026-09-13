@@ -283,9 +283,17 @@ async fn an_answer_beyond_the_segment_clears_everything_under_it() {
     );
 }
 
-type SeenRequest = (String, String, String, String, String);
+type SeenRequest = (String, String, String, String, String, String, String);
 
 async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>) -> SocketAddr {
+    fake_signy_with_body(status, Bytes::from_static(br#"{"stored":42}"#), seen).await
+}
+
+async fn fake_signy_with_body(
+    status: http::StatusCode,
+    response_body: Bytes,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a bound port");
@@ -297,7 +305,78 @@ async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>
                 return;
             };
             let seen = seen.clone();
+            let response_body = response_body.clone();
             tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |request: http::Request<hyper::body::Incoming>| {
+                        let seen = seen.clone();
+                        let response_body = response_body.clone();
+                        async move {
+                            let header = |name: &str| {
+                                request
+                                    .headers()
+                                    .get(name)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            seen.lock().push((
+                                request.uri().path().to_string(),
+                                header("content-encoding"),
+                                header(super::transport::SENDER_HEADER),
+                                header(super::transport::SIGNAL_HEADER),
+                                header(super::transport::SEGMENT_HEADER),
+                                header(super::transport::ACCESS_CLIENT_ID_HEADER),
+                                header(super::transport::ACCESS_CLIENT_SECRET_HEADER),
+                            ));
+                            http::Response::builder()
+                                .status(status)
+                                .body(http_body_util::Full::new(response_body))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    address
+}
+
+async fn fake_https_signy(
+    status: http::StatusCode,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a certificate");
+    let certificate = cert.der().clone();
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+        )
+        .expect("a server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a bound port");
+    let address = listener.local_addr().expect("an address");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
                 let service = hyper::service::service_fn(
                     move |request: http::Request<hyper::body::Incoming>| {
                         let seen = seen.clone();
@@ -316,6 +395,8 @@ async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>
                                 header(super::transport::SENDER_HEADER),
                                 header(super::transport::SIGNAL_HEADER),
                                 header(super::transport::SEGMENT_HEADER),
+                                header(super::transport::ACCESS_CLIENT_ID_HEADER),
+                                header(super::transport::ACCESS_CLIENT_SECRET_HEADER),
                             ));
                             http::Response::builder().status(status).body(
                                 http_body_util::Full::new(Bytes::from_static(br#"{"stored":42}"#)),
@@ -330,7 +411,17 @@ async fn fake_signy(status: http::StatusCode, seen: Arc<Mutex<Vec<SeenRequest>>>
         }
     });
 
-    address
+    (address, certificate)
+}
+
+fn client_config_trusting(
+    certificate: rustls::pki_types::CertificateDer<'static>,
+) -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate).expect("a trusted root");
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 #[tokio::test]
@@ -357,9 +448,124 @@ async fn a_success_over_http_carries_the_encoding_and_who_sent_which_segment() {
             "zstd".to_string(),
             sender,
             "traces".to_string(),
-            "7".to_string()
+            "7".to_string(),
+            "".to_string(),
+            "".to_string()
         )]
     );
+}
+
+#[tokio::test]
+async fn access_credentials_are_sent_as_the_two_cloudflare_headers() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let address = fake_signy(http::StatusCode::OK, seen.clone()).await;
+    let transport = HttpTransport::with_access(
+        format!("http://{address}"),
+        Duration::from_secs(5),
+        Some("client-id".to_string()),
+        Some("client-secret".to_string()),
+    );
+
+    let outcome = transport.deliver(shipment(b"frames")).await;
+
+    assert_eq!(outcome, Outcome::Accepted(42));
+    assert_eq!(seen.lock()[0].5, "client-id");
+    assert_eq!(seen.lock()[0].6, "client-secret");
+}
+
+#[tokio::test]
+async fn access_credentials_are_redacted_from_error_reasons() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let address = fake_signy_with_body(
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(b"client client-secret"),
+        seen,
+    )
+    .await;
+    let transport = HttpTransport::with_access(
+        format!("http://{address}"),
+        Duration::from_secs(5),
+        Some("client".to_string()),
+        Some("client-secret".to_string()),
+    );
+
+    let outcome = transport.deliver(shipment(b"frames")).await;
+    let reason = match outcome {
+        Outcome::Retry(reason) => reason,
+        other => panic!("expected retry, got {other:?}"),
+    };
+
+    assert!(!reason.contains("client"));
+    assert!(!reason.contains("client-secret"));
+    assert_eq!(reason.matches("[REDACTED]").count(), 2);
+}
+
+#[tokio::test]
+async fn a_credential_cannot_change_the_stored_cursor_parsing() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let address = fake_signy(http::StatusCode::OK, seen).await;
+    let transport = HttpTransport::with_access(
+        format!("http://{address}"),
+        Duration::from_secs(5),
+        Some("client-id".to_string()),
+        Some("stored".to_string()),
+    );
+
+    assert_eq!(
+        transport.deliver(shipment(b"frames")).await,
+        Outcome::Accepted(42)
+    );
+}
+
+#[tokio::test]
+async fn a_verified_https_certificate_and_hostname_are_required() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (address, certificate) = fake_https_signy(http::StatusCode::OK, seen.clone()).await;
+    let transport = HttpTransport::with_tls_config(
+        format!("https://localhost:{}", address.port()),
+        Duration::from_secs(5),
+        Some("client-id".to_string()),
+        Some("client-secret".to_string()),
+        client_config_trusting(certificate),
+    );
+
+    let outcome = transport.deliver(shipment(b"frames")).await;
+
+    assert_eq!(outcome, Outcome::Accepted(42));
+    assert_eq!(seen.lock()[0].5, "client-id");
+    assert_eq!(seen.lock()[0].6, "client-secret");
+}
+
+#[tokio::test]
+async fn an_untrusted_or_mismatched_https_certificate_is_rejected() {
+    let untrusted_seen = Arc::new(Mutex::new(Vec::new()));
+    let (untrusted_address, _) =
+        fake_https_signy(http::StatusCode::OK, untrusted_seen.clone()).await;
+    let untrusted = HttpTransport::new(
+        format!("https://localhost:{}", untrusted_address.port()),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(
+        untrusted.deliver(shipment(b"frames")).await,
+        Outcome::Retry(_)
+    ));
+    assert!(untrusted_seen.lock().is_empty());
+
+    let mismatched_seen = Arc::new(Mutex::new(Vec::new()));
+    let (mismatched_address, certificate) =
+        fake_https_signy(http::StatusCode::OK, mismatched_seen.clone()).await;
+    let mismatched = HttpTransport::with_tls_config(
+        format!("https://127.0.0.1:{}", mismatched_address.port()),
+        Duration::from_secs(5),
+        None,
+        None,
+        client_config_trusting(certificate),
+    );
+    assert!(matches!(
+        mismatched.deliver(shipment(b"frames")).await,
+        Outcome::Retry(_)
+    ));
+    assert!(mismatched_seen.lock().is_empty());
 }
 
 #[tokio::test]

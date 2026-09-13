@@ -1,9 +1,11 @@
+use std::sync::Once;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
-use http::{Method, Request, StatusCode};
+use http::{HeaderValue, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -21,22 +23,81 @@ use super::{DeliverFuture, Outcome, Shipment, Transport};
 pub const SENDER_HEADER: &str = "x-collecty-sender";
 pub const SIGNAL_HEADER: &str = "x-collecty-signal";
 pub const SEGMENT_HEADER: &str = "x-collecty-segment";
+pub const ACCESS_CLIENT_ID_HEADER: &str = "CF-Access-Client-Id";
+pub const ACCESS_CLIENT_SECRET_HEADER: &str = "CF-Access-Client-Secret";
 const REASON_LIMIT: usize = 512;
 
+type HttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 pub struct HttpTransport {
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: HttpsClient,
     base: String,
     timeout: Duration,
+    access_client_id: Option<String>,
+    access_client_secret: Option<String>,
 }
 
 impl HttpTransport {
     pub fn new(base: impl Into<String>, timeout: Duration) -> HttpTransport {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
+        ensure_crypto_provider();
+        let connector = default_connector();
+        Self::with_connector(base, timeout, connector, None, None)
+    }
+
+    pub fn with_access(
+        base: impl Into<String>,
+        timeout: Duration,
+        access_client_id: Option<String>,
+        access_client_secret: Option<String>,
+    ) -> HttpTransport {
+        ensure_crypto_provider();
+        let connector = default_connector();
+        Self::with_connector(
+            base,
+            timeout,
+            connector,
+            access_client_id,
+            access_client_secret,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tls_config(
+        base: impl Into<String>,
+        timeout: Duration,
+        access_client_id: Option<String>,
+        access_client_secret: Option<String>,
+        tls_config: rustls::ClientConfig,
+    ) -> HttpTransport {
+        ensure_crypto_provider();
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http_connector());
+        Self::with_connector(
+            base,
+            timeout,
+            connector,
+            access_client_id,
+            access_client_secret,
+        )
+    }
+
+    fn with_connector(
+        base: impl Into<String>,
+        timeout: Duration,
+        connector: HttpsConnector<HttpConnector>,
+        access_client_id: Option<String>,
+        access_client_secret: Option<String>,
+    ) -> HttpTransport {
+        let base = normalize_scheme(base.into());
         HttpTransport {
             client: Client::builder(TokioExecutor::new()).build(connector),
-            base: base.into().trim_end_matches('/').to_string(),
+            base: base.trim_end_matches('/').to_string(),
             timeout,
+            access_client_id,
+            access_client_secret,
         }
     }
 
@@ -45,23 +106,59 @@ impl HttpTransport {
     }
 }
 
+static CRYPTO_PROVIDER: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn http_connector() -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    connector.set_nodelay(true);
+    connector
+}
+
+fn default_connector() -> HttpsConnector<HttpConnector> {
+    HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http_connector())
+}
+
+fn normalize_scheme(value: String) -> String {
+    let Some(separator) = value.find("://") else {
+        return value;
+    };
+    let (scheme, rest) = value.split_at(separator);
+    format!("{}{}", scheme.to_ascii_lowercase(), rest)
+}
+
 impl Transport for HttpTransport {
     fn deliver<'a>(&'a self, shipment: Shipment) -> DeliverFuture<'a> {
         Box::pin(async move {
             let uri = self.route();
-            let request = match Request::builder()
+            let request_builder = Request::builder()
                 .method(Method::POST)
                 .uri(&uri)
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "zstd")
                 .header(SENDER_HEADER, shipment.sender.to_string())
                 .header(SIGNAL_HEADER, shipment.signal.as_str())
-                .header(SEGMENT_HEADER, shipment.segment.to_string())
-                .body(Full::new(shipment.body))
+                .header(SEGMENT_HEADER, shipment.segment.to_string());
+            let request = match add_access_headers(
+                request_builder,
+                &self.access_client_id,
+                &self.access_client_secret,
+            )
+            .and_then(|builder| builder.body(Full::new(shipment.body)).map_err(|_| ()))
             {
                 Ok(request) => request,
-                Err(error) => {
-                    return Outcome::Refused(format!("cannot build a request for {uri}: {error}"));
+                Err(_) => {
+                    return Outcome::Refused(format!("cannot build a request for {uri}"));
                 }
             };
 
@@ -83,15 +180,23 @@ impl Transport for HttpTransport {
                 .collect()
                 .await
                 .map(|collected| {
-                    let text = String::from_utf8_lossy(&collected.to_bytes())
+                    String::from_utf8_lossy(&collected.to_bytes())
                         .trim()
-                        .to_string();
-                    text.chars().take(REASON_LIMIT).collect::<String>()
+                        .to_string()
                 })
                 .unwrap_or_default();
+            let stored = stored_number(&explanation);
+            let explanation = redact(
+                &explanation,
+                &self.access_client_id,
+                &self.access_client_secret,
+            )
+            .chars()
+            .take(REASON_LIMIT)
+            .collect::<String>();
 
             if status.is_success() {
-                return Outcome::Accepted(stored_number(&explanation));
+                return Outcome::Accepted(stored);
             }
 
             let reason = format!("{uri}: {status} {explanation}");
@@ -103,6 +208,44 @@ impl Transport for HttpTransport {
             }
         })
     }
+}
+
+fn add_access_headers(
+    mut builder: http::request::Builder,
+    access_client_id: &Option<String>,
+    access_client_secret: &Option<String>,
+) -> Result<http::request::Builder, ()> {
+    if let Some(access_client_id) = access_client_id {
+        builder = builder.header(
+            ACCESS_CLIENT_ID_HEADER,
+            HeaderValue::try_from(access_client_id).map_err(|_| ())?,
+        );
+    }
+    if let Some(access_client_secret) = access_client_secret {
+        builder = builder.header(
+            ACCESS_CLIENT_SECRET_HEADER,
+            HeaderValue::try_from(access_client_secret).map_err(|_| ())?,
+        );
+    }
+    Ok(builder)
+}
+
+fn redact(
+    text: &str,
+    access_client_id: &Option<String>,
+    access_client_secret: &Option<String>,
+) -> String {
+    let mut redacted = text.to_string();
+    let mut credentials = [access_client_id.as_deref(), access_client_secret.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|credential| !credential.is_empty())
+        .collect::<Vec<_>>();
+    credentials.sort_by_key(|credential| std::cmp::Reverse(credential.len()));
+    for credential in credentials {
+        redacted = redacted.replace(credential, "[REDACTED]");
+    }
+    redacted
 }
 
 /// The segment signy says it now holds whole, out of `{"stored":n}`.

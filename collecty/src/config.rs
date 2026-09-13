@@ -1,16 +1,21 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{fmt, fmt::Formatter};
+
+use http::header::HeaderValue;
 
 use crate::queue::QueueLimits;
 use crate::receive::{DEFAULT_LISTEN_ADDR, DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_REQUEST_BYTES};
 use crate::send::SenderConfig;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub data_dir: PathBuf,
     pub signy_url: String,
+    pub signy_access_client_id: Option<String>,
+    pub signy_access_client_secret: Option<String>,
     pub max_request_bytes: usize,
     pub max_inflight_bytes: usize,
     pub queue: QueueLimits,
@@ -30,6 +35,43 @@ pub struct Config {
     pub generated_telemetry_tenant: Option<String>,
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("listen_addr", &self.listen_addr)
+            .field("data_dir", &self.data_dir)
+            .field("signy_url", &self.signy_url)
+            .field(
+                "signy_access_client_id",
+                &self.signy_access_client_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "signy_access_client_secret",
+                &self
+                    .signy_access_client_secret
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .field("max_request_bytes", &self.max_request_bytes)
+            .field("max_inflight_bytes", &self.max_inflight_bytes)
+            .field("queue", &self.queue)
+            .field("sender", &self.sender)
+            .field("send_timeout", &self.send_timeout)
+            .field("report_interval", &self.report_interval)
+            .field("zstd_level", &self.zstd_level)
+            .field("log_json", &self.log_json)
+            .field("host_metrics_interval", &self.host_metrics_interval)
+            .field("host_metrics_root", &self.host_metrics_root)
+            .field("journal", &self.journal)
+            .field(
+                "generated_telemetry_tenant",
+                &self.generated_telemetry_tenant,
+            )
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct JournalConfig {
     pub directory: Option<PathBuf>,
@@ -46,6 +88,8 @@ impl Default for Config {
                 .expect("the default listen address parses"),
             data_dir: PathBuf::from("/var/lib/collecty"),
             signy_url: "http://127.0.0.1:3100".to_string(),
+            signy_access_client_id: None,
+            signy_access_client_secret: None,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             queue: QueueLimits::default(),
@@ -69,6 +113,8 @@ impl Config {
             listen_addr: socket_addr("COLLECTY_LISTEN_ADDR", defaults.listen_addr)?,
             data_dir: path("COLLECTY_DATA_DIR", defaults.data_dir),
             signy_url: string("COLLECTY_SIGNY_URL", defaults.signy_url),
+            signy_access_client_id: optional_secret("COLLECTY_SIGNY_ACCESS_CLIENT_ID")?,
+            signy_access_client_secret: optional_secret("COLLECTY_SIGNY_ACCESS_CLIENT_SECRET")?,
             max_request_bytes: bytes("COLLECTY_MAX_REQUEST_BYTES", defaults.max_request_bytes)?,
             max_inflight_bytes: bytes("COLLECTY_MAX_INFLIGHT_BYTES", defaults.max_inflight_bytes)?,
             queue: QueueLimits {
@@ -103,6 +149,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        validate_signy_url(&self.signy_url)?;
+        validate_access_credentials(
+            &self.signy_access_client_id,
+            &self.signy_access_client_secret,
+        )?;
         if self.max_request_bytes > u32::MAX as usize {
             return Err(format!(
                 "COLLECTY_MAX_REQUEST_BYTES is {} and cannot exceed {}",
@@ -163,6 +214,63 @@ COLLECTY_MAX_REQUEST_BYTES ({}) export",
 
 fn string(name: &str, fallback: String) -> String {
     std::env::var(name).unwrap_or(fallback)
+}
+
+fn optional_secret(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(value) if value.is_empty() => Err(format!("{name} must not be empty")),
+        Ok(value) => Ok(Some(value)),
+    }
+}
+
+fn validate_signy_url(value: &str) -> Result<(), String> {
+    let uri = value
+        .parse::<http::Uri>()
+        .map_err(|error| format!("invalid COLLECTY_SIGNY_URL: {error}"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| "COLLECTY_SIGNY_URL must include http:// or https://".to_string())?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!(
+            "COLLECTY_SIGNY_URL uses unsupported scheme {scheme:?}; expected http or https"
+        ));
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| "COLLECTY_SIGNY_URL must include a host".to_string())?;
+    if authority.host().is_empty() {
+        return Err("COLLECTY_SIGNY_URL must include a host".to_string());
+    }
+    if authority.as_str().contains('@') {
+        return Err("COLLECTY_SIGNY_URL must not include user information".to_string());
+    }
+    if uri.query().is_some() {
+        return Err("COLLECTY_SIGNY_URL must not include a query".to_string());
+    }
+    Ok(())
+}
+
+fn validate_access_credentials(
+    access_client_id: &Option<String>,
+    access_client_secret: &Option<String>,
+) -> Result<(), String> {
+    if access_client_id.is_some() != access_client_secret.is_some() {
+        return Err(
+            "COLLECTY_SIGNY_ACCESS_CLIENT_ID and COLLECTY_SIGNY_ACCESS_CLIENT_SECRET must be set together"
+                .to_string(),
+        );
+    }
+    for (name, value) in [
+        ("COLLECTY_SIGNY_ACCESS_CLIENT_ID", access_client_id),
+        ("COLLECTY_SIGNY_ACCESS_CLIENT_SECRET", access_client_secret),
+    ] {
+        if let Some(value) = value {
+            HeaderValue::try_from(value)
+                .map_err(|_| format!("{name} must be a valid HTTP header value"))?;
+        }
+    }
+    Ok(())
 }
 
 /// The same grammar signy validates a tenant id against, checked here so a
@@ -454,6 +562,50 @@ mod tests {
     #[test]
     fn the_defaults_are_consistent() {
         Config::default().validate().expect("consistent defaults");
+    }
+
+    #[test]
+    fn signy_accepts_http_and_https_urls_only() {
+        validate_signy_url("http://127.0.0.1:3100").expect("http");
+        validate_signy_url("https://signy.example.test").expect("https");
+        validate_signy_url("HTTPS://signy.example.test").expect("case-insensitive scheme");
+        assert!(validate_signy_url("ftp://signy.example.test").is_err());
+        assert!(validate_signy_url("signy.example.test").is_err());
+        assert!(validate_signy_url("https:///missing-host").is_err());
+        assert!(validate_signy_url("https://user:pass@signy.example.test").is_err());
+        assert!(validate_signy_url("https://signy.example.test?token=secret").is_err());
+    }
+
+    #[test]
+    fn access_credentials_are_optional_but_must_be_a_pair_of_headers() {
+        validate_access_credentials(&None, &None).expect("unset");
+        validate_access_credentials(
+            &Some("client-id".to_string()),
+            &Some("client-secret".to_string()),
+        )
+        .expect("valid headers");
+        assert!(validate_access_credentials(&Some("client-id".to_string()), &None).is_err());
+        assert!(validate_access_credentials(&None, &Some("client-secret".to_string())).is_err());
+        assert!(
+            validate_access_credentials(
+                &Some("client\n-id".to_string()),
+                &Some("client-secret".to_string())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_access_credentials() {
+        let config = Config {
+            signy_access_client_id: Some("client-id".to_string()),
+            signy_access_client_secret: Some("client-secret".to_string()),
+            ..Config::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("client-id"));
+        assert!(!debug.contains("client-secret"));
+        assert_eq!(debug.matches("[REDACTED]").count(), 2);
     }
 
     #[test]

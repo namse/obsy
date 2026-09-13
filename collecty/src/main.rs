@@ -98,9 +98,11 @@ async fn run(config: Config) -> Result<(), String> {
     }
 
     let (shutdown, watcher) = watch::channel(false);
-    let transport = Arc::new(HttpTransport::new(
+    let transport = Arc::new(HttpTransport::with_access(
         config.signy_url.clone(),
         config.send_timeout,
+        config.signy_access_client_id.clone(),
+        config.signy_access_client_secret.clone(),
     ));
 
     let sender = Sender::new(queue.clone(), spool.clone(), transport, config.sender);

@@ -75,7 +75,7 @@ pub async fn metrics_instant(
     let at_ns = params.at_ns.unwrap_or(now_ns);
     // The retention floor clamps a window; an instant either survives it or
     // answers empty, which keeps the alert path's semantics one sentence.
-    if let Some(floor_ns) = state.tenant_policy.query_floor_ns(&tenant)
+    if let Some(floor_ns) = state.tenant_policy.query_floor_ns(&tenant, crate::tenant_policy::Signal::Metrics)
         && at_ns < floor_ns
     {
         return Ok(ndjson_response(String::new(), 0, 0));
@@ -280,7 +280,7 @@ see docs/QUERY_API.md"
     })?;
     let end_ns = params.end_ns.unwrap_or(now_ns);
     validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
-    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant));
+    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant, crate::tenant_policy::Signal::Metrics));
     if start_ns > end_ns {
         return Ok(None);
     }

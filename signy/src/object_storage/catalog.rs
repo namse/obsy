@@ -557,6 +557,81 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Ok(next.trace_manifest)
     }
 
+    /// Uploads a trace compaction's replacement and swaps it for its inputs in
+    /// one catalog commit, so there is no generation in which both the inputs
+    /// and the replacement answer a query. Idempotent: a replay after a crash
+    /// that already committed finds the replacement present and the inputs
+    /// gone, and changes nothing. An input that is missing while the
+    /// replacement is not yet present means something else, such as retention,
+    /// removed it first, and the caller must step aside.
+    pub async fn replace_trace_parts(
+        &self,
+        added: &[TracePart],
+        removed: &[TraceManifestPart],
+    ) -> Result<TraceManifest, String> {
+        for part in added {
+            let id = part.meta.id.clone();
+            TracePartReader::open(part.clone())
+                .map_err(|error| format!("refusing to publish invalid trace part {id}: {error}"))?;
+        }
+        for part in added {
+            self.upload_trace_part(part).await?;
+        }
+
+        let state = self.load_catalog_state().await?;
+        self.check_epoch(state.writer_epoch)?;
+        let removed_ids: Vec<String> = removed.iter().map(|part| part.id.clone()).collect();
+        let descriptors: Vec<TraceManifestPart> = added
+            .iter()
+            .map(|part| TraceManifestPart {
+                id: part.meta.id.clone(),
+                partition: part.meta.partition.clone(),
+            })
+            .collect();
+        let present_removed = state
+            .trace_manifest
+            .parts
+            .iter()
+            .filter(|part| removed_ids.iter().any(|id| id == &part.id))
+            .count();
+        let all_added_present = descriptors
+            .iter()
+            .all(|descriptor| state.trace_manifest.parts.contains(descriptor));
+        if present_removed == 0 && all_added_present {
+            return Ok(state.trace_manifest);
+        }
+        if present_removed != removed_ids.len() {
+            return Err(format!(
+                "{INPUTS_CHANGED_ERROR}: expected {} input trace parts, found {present_removed}",
+                removed_ids.len()
+            ));
+        }
+        for descriptor in &descriptors {
+            if let Some(existing) = state
+                .trace_manifest
+                .parts
+                .iter()
+                .find(|item| item.id == descriptor.id)
+                && existing != descriptor
+            {
+                return Err(format!(
+                    "trace manifest part ID collision: {}",
+                    descriptor.id
+                ));
+            }
+        }
+        let next = self
+            .commit_catalog_mutation(CatalogMutation {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                trace_added: descriptors,
+                trace_removed: removed_ids,
+                ..Default::default()
+            })
+            .await?;
+        Ok(next.trace_manifest)
+    }
+
     /// Removes trace descriptors from the manifest using the same CAS
     /// semantics as publication. The immutable objects are deleted only after
     /// the manifest no longer exposes them.

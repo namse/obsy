@@ -20,7 +20,7 @@ fn metric_discovery_window(
             .unwrap_or(i64::MIN)
     });
     validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
-    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant));
+    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant, crate::tenant_policy::Signal::Metrics));
     if start_ns > end_ns {
         return Ok(None);
     }

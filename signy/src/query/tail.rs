@@ -192,7 +192,7 @@ async fn tail_poll(
     // The retention floor is re-read every poll rather than resolved once: a
     // tail can outlive the policy it started under, and a downgrade has to take
     // effect on a live connection too.
-    let scan_start = clamp_to_retention(cursor.since_ns, state.tenant_policy.query_floor_ns(tenant));
+    let scan_start = clamp_to_retention(cursor.since_ns, state.tenant_policy.query_floor_ns(tenant, crate::tenant_policy::Signal::Logs));
     if scan_start > end_ns {
         return None;
     }

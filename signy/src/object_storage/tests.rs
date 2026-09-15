@@ -321,6 +321,101 @@
         assert!(recovered.load_manifest().await.is_err());
     }
 
+    async fn commit_alternating_trace_generations(storage: &ObjectStorage, count: u64) {
+        let descriptor = TraceManifestPart {
+            id: "catalog-prune-part".to_string(),
+            partition: "2026-01-01".to_string(),
+        };
+        for generation in 1..=count {
+            let mutation = if generation % 2 == 1 {
+                CatalogMutation {
+                    trace_added: vec![descriptor.clone()],
+                    ..Default::default()
+                }
+            } else {
+                CatalogMutation {
+                    trace_removed: vec![descriptor.id.clone()],
+                    ..Default::default()
+                }
+            };
+            storage.commit_catalog_mutation(mutation).await.unwrap();
+        }
+    }
+
+    /// Pruning has to leave a catalog a startup can still read when the newest
+    /// snapshot is the one that went bad, which is what the second verified
+    /// snapshot and the commits after it are kept for.
+    #[tokio::test]
+    async fn catalog_pruning_keeps_the_fallback_snapshot_and_its_commits() {
+        let storage = ObjectStorage::in_memory();
+        let newest_generation = CATALOG_SNAPSHOT_INTERVAL * 3 + 5;
+        commit_alternating_trace_generations(&storage, newest_generation).await;
+        let state_before_pruning = storage.load_catalog_state().await.unwrap();
+        let min_age = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+
+        assert_eq!(
+            storage
+                .prune_catalog_at(min_age, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0,
+            "nothing younger than the minimum age is deleted"
+        );
+
+        let removed = storage
+            .prune_catalog_at(min_age, chrono::Utc::now() + chrono::Duration::days(30))
+            .await
+            .unwrap();
+        let oldest_kept_snapshot = CATALOG_SNAPSHOT_INTERVAL * 2;
+        assert_eq!(
+            removed as u64,
+            2 + (oldest_kept_snapshot - 1) * 2,
+            "one older snapshot and every commit before the fallback snapshot, on both replicas"
+        );
+
+        let newest_snapshot = CATALOG_SNAPSHOT_INTERVAL * 3;
+        for replica in ["a", "b"] {
+            storage
+                .store
+                .put(
+                    &storage.catalog_snapshot_path(replica, newest_snapshot),
+                    Bytes::from_static(b"damaged").into(),
+                )
+                .await
+                .unwrap();
+        }
+        let restarted = ObjectStorage::sharing_store_for_test(storage.store.clone());
+        assert_eq!(
+            restarted.load_catalog_state().await.unwrap(),
+            state_before_pruning,
+            "a startup falls back to the older snapshot and replays the kept commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_pruning_needs_two_verified_snapshots() {
+        let storage = ObjectStorage::in_memory();
+        commit_alternating_trace_generations(&storage, CATALOG_SNAPSHOT_INTERVAL * 2 + 1).await;
+        storage
+            .store
+            .put(
+                &storage.catalog_snapshot_path("b", CATALOG_SNAPSHOT_INTERVAL),
+                Bytes::from_static(b"damaged").into(),
+            )
+            .await
+            .unwrap();
+
+        let removed = storage
+            .prune_catalog_at(
+                std::time::Duration::from_secs(60),
+                chrono::Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 0, "one intact snapshot is not enough to prune behind");
+    }
+
     #[tokio::test]
     async fn one_catalog_generation_carries_all_signal_mutations() {
         let storage = ObjectStorage::in_memory();

@@ -95,6 +95,21 @@ alongside `max_stored_bytes`, which is what a control plane shows a customer.
 The body is the complete policy, not a patch. If it is pushed without `max_stored_bytes`, the existing
 value is **cleared** and reverts to the default above.
 
+### Per-signal retention
+
+`retention` applies to logs, traces and metrics alike unless the body overrides it for a signal:
+
+```
+PUT /signy/api/v1/admin/tenants/{tenant}/retention
+{"retention": "30d", "log_retention": "14d", "trace_retention": "3d"}
+```
+
+`log_retention`, `trace_retention` and `metric_retention` take the same spellings as `retention`.
+A signal with no override uses `retention`, so a signal is never kept longer by leaving it out, and
+an override left out of a later push is cleared like `max_stored_bytes`. Each signal's queries are
+clamped to that signal's floor. `retention: "0"` still deletes the tenant, so a push that pairs it
+with an override that keeps data is refused with `400`.
+
 These limits apply to one instance; they are not the monthly usage sold by a plan. Monthly usage spans
 multiple instances and outlives any instance, so only the control plane can own that state.
 
@@ -254,6 +269,8 @@ and there is no global period.
 | `SIGNY_RETENTION_BATCH_SIZE` | 100 | Number of parts processed per tick |
 | `SIGNY_RETENTION_GRACE_PERIOD` | `1h` | Grace period before deleting orphan objects |
 | `SIGNY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention/GC |
+| `SIGNY_ORPHAN_GC_INTERVAL` | `1h` | How often part objects that no manifest names are collected, whether or not retention retired anything. Merges and compactions leave their inputs behind as orphans too |
+| `SIGNY_CATALOG_PRUNE_MIN_AGE` | `off` | Delete catalog commits and snapshots older than this that no startup reads any more. Two snapshots that verify on both replicas, and every commit from the older of them on, are always kept. **Set it above the Bucket Lock age on `catalog/`**, which refuses younger deletes; with a seven-day lock, `8d` |
 | `SIGNY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Rewrite when the expired-row fraction of a part exceeds this value. Tenant deletion (`retention: "0"`) ignores this value |
 
 ## Cache

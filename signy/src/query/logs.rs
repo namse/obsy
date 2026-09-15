@@ -73,7 +73,7 @@ pub async fn logs(
     // Retention is enforced logically before any scan; a floor above `end`
     // yields the empty answer rather than an error, exactly as on the ranges
     // it merely shortens.
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant, crate::tenant_policy::Signal::Logs);
     let start_ns = clamp_to_retention(start_ns, retention_floor_ns);
     if start_ns > end_ns {
         return Ok(ndjson_response(String::new(), 0, 0));
@@ -134,7 +134,7 @@ pub async fn logs_histogram(
             .unwrap_or(i64::MIN)
     });
     validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant, crate::tenant_policy::Signal::Logs);
     let start_ns = clamp_to_retention(start_ns, retention_floor_ns);
     if start_ns >= end_ns {
         return Ok(ndjson_response(String::new(), 0, 0));

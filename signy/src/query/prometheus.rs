@@ -357,6 +357,7 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
             .render("signy_remote_restore_latency_ms"),
     );
     body.push_str(&object_store_operation_metrics(&state));
+    body.push_str(&object_store_gc_metrics(&state));
     body.push_str(&restore_economics_metrics());
     body.push_str(&delete_request_metrics(&state));
     body.push_str(&journal_writer_metrics(&state));
@@ -376,6 +377,38 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
 /// until these there was no number in the process that could say so.
 /// The M14 degradation ladder's observability: every rung moves one of these,
 /// and the comparison bed's churn table is built from them.
+fn object_store_gc_metrics(state: &AppState) -> String {
+    let metrics = &state.metrics;
+    let mut out = String::new();
+    for (name, help, value) in [
+        (
+            "signy_object_store_gc_success_total",
+            "Object-store collection passes that finished: orphaned part objects, and superseded catalog objects when SIGNY_CATALOG_PRUNE_MIN_AGE is set.",
+            metrics.object_store_gc_success.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_object_store_gc_errors_total",
+            "Object-store collection passes that failed or timed out. The next pass resumes from the stored orphan ledger.",
+            metrics.object_store_gc_errors.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_objects_removed_total",
+            "Part objects deleted because no manifest named them for longer than SIGNY_RETENTION_GRACE_PERIOD.",
+            metrics.orphan_objects_removed.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_catalog_objects_pruned_total",
+            "Catalog commit and snapshot objects deleted because no startup reads them any more.",
+            metrics.catalog_objects_pruned.load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+        ));
+    }
+    out
+}
+
 fn series_ladder_metrics(state: &AppState) -> String {
     use std::sync::atomic::Ordering;
     let series = state.journal.series_memtable();

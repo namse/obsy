@@ -605,6 +605,7 @@ pub fn discover_trace_parts(root: &Path) -> Result<Vec<TracePart>, String> {
             .map_err(|error| error.to_string())?
             .is_dir()
             || partition.file_name() == ".tmp"
+            || partition.file_name() == ".compact"
         {
             continue;
         }

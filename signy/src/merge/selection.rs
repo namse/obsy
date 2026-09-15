@@ -283,7 +283,7 @@ pub fn rewrite_group(
     let mut merged = part::MergedRows::new(readers, page_bytes);
     let mut keep = |row: &part::Row| {
         if let Some(cutoffs) = cutoffs
-            && cutoffs.is_expired(&row.tenant, row.timestamp_ns)
+            && cutoffs.is_expired(&row.tenant, crate::tenant_policy::Signal::Logs, row.timestamp_ns)
         {
             return false;
         }

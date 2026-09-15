@@ -82,6 +82,10 @@ pub struct RuntimeMetrics {
     /// expired rows in them stay on disk. A number that keeps rising means a
     /// part is permanently too large for `merge_max_memory_bytes`.
     pub retention_rewrite_skipped: AtomicU64,
+    pub object_store_gc_success: AtomicU64,
+    pub object_store_gc_errors: AtomicU64,
+    pub orphan_objects_removed: AtomicU64,
+    pub catalog_objects_pruned: AtomicU64,
     pub query_success: AtomicU64,
     pub query_errors: AtomicU64,
     pub query_scanned_rows: AtomicU64,
@@ -184,6 +188,10 @@ impl RuntimeMetrics {
             retention_expired_rows_dropped: AtomicU64::new(0),
             retention_parts_rewritten: AtomicU64::new(0),
             retention_rewrite_skipped: AtomicU64::new(0),
+            object_store_gc_success: AtomicU64::new(0),
+            object_store_gc_errors: AtomicU64::new(0),
+            orphan_objects_removed: AtomicU64::new(0),
+            catalog_objects_pruned: AtomicU64::new(0),
             query_success: AtomicU64::new(0),
             query_errors: AtomicU64::new(0),
             query_scanned_rows: AtomicU64::new(0),

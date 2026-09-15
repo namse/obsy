@@ -132,6 +132,14 @@ pub struct Config {
     pub retention_batch_size: usize,
     pub retention_grace_period: Duration,
     pub max_retention_runtime: Duration,
+    /// How often unreferenced part objects are collected. Independent of
+    /// retention, because merges and compactions orphan their inputs too, and
+    /// a deployment younger than its retention period retires nothing.
+    pub orphan_gc_interval: Duration,
+    /// Age past which catalog commits and snapshots that no startup reads any
+    /// more are deleted, or `None` to keep all of them. It has to exceed the
+    /// Bucket Lock rule on `catalog/`, which refuses younger deletes.
+    pub catalog_prune_min_age: Option<Duration>,
     /// Queries one tenant may have running at once.
     ///
     /// Without it a single tenant issuing concurrent scans takes every permit
@@ -324,6 +332,8 @@ impl Default for Config {
             retention_batch_size: 100,
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
+            orphan_gc_interval: Duration::from_secs(60 * 60),
+            catalog_prune_min_age: None,
             max_concurrent_queries_per_tenant: 4,
             default_tenant_max_stored_bytes: None,
             min_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
@@ -666,6 +676,14 @@ impl Config {
             max_retention_runtime: env_required_duration(
                 "SIGNY_MAX_RETENTION_RUNTIME",
                 defaults.max_retention_runtime,
+            )?,
+            orphan_gc_interval: env_required_duration(
+                "SIGNY_ORPHAN_GC_INTERVAL",
+                defaults.orphan_gc_interval,
+            )?,
+            catalog_prune_min_age: env_duration(
+                "SIGNY_CATALOG_PRUNE_MIN_AGE",
+                defaults.catalog_prune_min_age,
             )?,
             max_concurrent_queries_per_tenant: env_positive_usize(
                 "SIGNY_MAX_CONCURRENT_QUERIES_PER_TENANT",

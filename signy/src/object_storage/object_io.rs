@@ -334,16 +334,15 @@ impl ObjectStorage {
     async fn replay_metric_compactions(&self, metrics_root: &Path) -> Result<(), String> {
         for (path, record) in crate::series_merge::read_records(metrics_root)? {
             let mut new_parts = Vec::new();
+            let mut new_dirs = Vec::new();
             let mut durable = true;
             for relative in &record.new {
                 let dir = crate::series_merge::record_dir(metrics_root, relative)?;
                 match crate::series_part::load_series_part(&dir) {
                     Ok(part) => new_parts.push(part),
-                    Err(_) => {
-                        durable = false;
-                        break;
-                    }
+                    Err(_) => durable = false,
                 }
+                new_dirs.push(dir);
             }
             if durable {
                 let mut input_descriptors = Vec::new();
@@ -359,10 +358,27 @@ impl ObjectStorage {
                     });
                     input_dirs.push(dir);
                 }
-                self.publish_metric_parts(&new_parts, &input_descriptors)
-                    .await?;
-                self.delete_metric_part_objects(&input_descriptors).await?;
-                crate::part::remove_part_dirs(&input_dirs)?;
+                match self
+                    .publish_metric_parts(&new_parts, &input_descriptors)
+                    .await
+                {
+                    Ok(_) => {
+                        self.delete_metric_part_objects(&input_descriptors).await?;
+                        crate::part::remove_part_dirs(&existing_dirs(&input_dirs))?;
+                    }
+                    // Neither the inputs nor the replacement are in the
+                    // manifest, so the manifest has already retired both.
+                    // Keeping either on disk would get it published again as
+                    // a part a local-only run left behind.
+                    Err(error) if is_inputs_changed_error(&error) => {
+                        tracing::warn!(%error, "dropping a metric compaction the manifest already retired");
+                        crate::part::remove_part_dirs(&existing_dirs(&new_dirs))?;
+                        crate::part::remove_part_dirs(&existing_dirs(&input_dirs))?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                crate::part::remove_part_dirs(&existing_dirs(&new_dirs))?;
             }
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -603,9 +619,13 @@ impl ObjectStorage {
                     input_descriptors.push(crate::trace_merge::record_input_descriptor(relative)?);
                 }
                 match self.replace_trace_parts(&new_parts, &input_descriptors).await {
-                    Ok(_) => crate::part::remove_part_dirs(&input_dirs)?,
+                    Ok(_) => crate::part::remove_part_dirs(&existing_dirs(&input_dirs))?,
+                    // See `replay_metric_compactions`: the manifest retired
+                    // both, and neither may be left for the unpublished scan.
                     Err(error) if is_inputs_changed_error(&error) => {
+                        tracing::warn!(%error, "dropping a trace compaction the manifest already retired");
                         crate::part::remove_part_dirs(&new_dirs)?;
+                        crate::part::remove_part_dirs(&existing_dirs(&input_dirs))?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -974,4 +994,10 @@ impl ObjectStorage {
         remove_upload_markers_best_effort(added);
         Ok(next.manifest)
     }
+}
+
+/// `remove_part_dirs` fsyncs each parent, which fails for a part that was
+/// never written and so has no partition directory.
+fn existing_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter().filter(|dir| dir.exists()).cloned().collect()
 }

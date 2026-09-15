@@ -594,6 +594,46 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Found in production: a record left from a pass whose inputs and
+    /// replacement the manifest no longer names. The replay has to drop both
+    /// rather than wedge startup or republish either.
+    #[tokio::test]
+    async fn a_remote_replay_drops_a_compaction_the_manifest_already_retired() {
+        let data_dir = temp_root("remote-retired");
+        let root = data_dir.join("metrics");
+        let series = labels("queue_depth", "a");
+        for index in 0..COMPACT_MIN_PARTS {
+            flush_one_part(
+                &root,
+                &series,
+                1_772_000_000_000_000_000 + index as i64 * 60_000_000_000,
+                5,
+            );
+        }
+        let registry = registry_over(&root);
+        let inputs = select_inputs(&registry.snapshot()).unwrap();
+        let new_parts = series_part::compact_series_parts(&inputs, &root).unwrap();
+        let record = CompactRecord {
+            new: new_parts
+                .iter()
+                .map(|part| relative_dir(&root, &part.dir).unwrap())
+                .collect(),
+            inputs: inputs
+                .iter()
+                .map(|reader| relative_dir(&root, &reader.part().dir).unwrap())
+                .collect(),
+        };
+        write_record(&root, &new_parts[0].meta.id, &record).unwrap();
+        let storage = crate::object_storage::ObjectStorage::in_memory();
+
+        let manifest = storage.reconcile_metric_local_cache(&root).await.unwrap();
+
+        assert!(manifest.parts.is_empty());
+        assert!(read_records(&root).unwrap().is_empty());
+        assert!(series_part::discover_series_parts(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
     #[test]
     fn a_record_whose_replacement_never_became_durable_keeps_the_inputs() {
         let root = temp_root("undone");

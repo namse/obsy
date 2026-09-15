@@ -31,6 +31,55 @@ pub enum TenantRetention {
     Infinite,
 }
 
+/// The kind of data a retention applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+/// A retention the control plane set for one signal, kept with the string it
+/// arrived as so a `GET` returns what was pushed.
+#[derive(Clone)]
+struct SignalRetention {
+    retention: TenantRetention,
+    raw: String,
+}
+
+/// Per-signal overrides of a tenant's `retention`. A signal with no override
+/// uses the tenant's `retention`, which is why a signal cannot be kept longer
+/// by saying nothing about it.
+#[derive(Clone, Default)]
+struct SignalRetentions {
+    logs: Option<SignalRetention>,
+    traces: Option<SignalRetention>,
+    metrics: Option<SignalRetention>,
+}
+
+impl SignalRetentions {
+    fn get(&self, signal: Signal) -> Option<&SignalRetention> {
+        match signal {
+            Signal::Logs => self.logs.as_ref(),
+            Signal::Traces => self.traces.as_ref(),
+            Signal::Metrics => self.metrics.as_ref(),
+        }
+    }
+
+    fn raw(&self, signal: Signal) -> Option<String> {
+        self.get(signal).map(|retention| retention.raw.clone())
+    }
+}
+
+/// The per-signal retention strings of one push, as the control plane sent
+/// them. `None` means the signal uses the tenant's `retention`.
+#[derive(Clone, Copy, Default)]
+pub struct SignalRetentionRequest<'a> {
+    pub logs: Option<&'a str>,
+    pub traces: Option<&'a str>,
+    pub metrics: Option<&'a str>,
+}
+
 /// How much a tenant may keep stored on this instance.
 ///
 /// A *stock*: nothing else bounds how much a tenant inside every other limit
@@ -66,6 +115,7 @@ struct PolicyEntry {
     /// returns what was pushed rather than a re-rendering of it.
     max_stored_bytes: Option<TenantStorageLimit>,
     raw_max_stored_bytes: Option<String>,
+    signal_retentions: SignalRetentions,
     updated_at: SystemTime,
 }
 
@@ -75,8 +125,18 @@ impl PolicyEntry {
             revision: self.revision,
             retention: self.raw.clone(),
             max_stored_bytes: self.raw_max_stored_bytes.clone(),
+            log_retention: self.signal_retentions.raw(Signal::Logs),
+            trace_retention: self.signal_retentions.raw(Signal::Traces),
+            metric_retention: self.signal_retentions.raw(Signal::Metrics),
             updated_at: self.updated_at,
         }
+    }
+
+    fn retention_for(&self, signal: Signal) -> TenantRetention {
+        self.signal_retentions
+            .get(signal)
+            .map(|override_retention| override_retention.retention)
+            .unwrap_or(self.retention)
     }
 }
 
@@ -86,6 +146,9 @@ pub struct PolicyView {
     pub revision: u64,
     pub retention: String,
     pub max_stored_bytes: Option<String>,
+    pub log_retention: Option<String>,
+    pub trace_retention: Option<String>,
+    pub metric_retention: Option<String>,
     pub updated_at: SystemTime,
 }
 
@@ -97,6 +160,12 @@ pub struct PolicyMap {
 impl PolicyMap {
     pub fn retention(&self, tenant: &TenantId) -> Option<TenantRetention> {
         self.entries.get(tenant).map(|entry| entry.retention)
+    }
+
+    pub fn signal_retention(&self, tenant: &TenantId, signal: Signal) -> Option<TenantRetention> {
+        self.entries
+            .get(tenant)
+            .map(|entry| entry.retention_for(signal))
     }
 
     pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
@@ -163,8 +232,8 @@ pub struct Cutoffs {
 impl Cutoffs {
     /// Oldest timestamp still retained for `tenant`, or `None` when nothing
     /// expires — an unknown tenant or an explicitly infinite one.
-    pub fn cutoff_ns(&self, tenant: &TenantId) -> Option<i64> {
-        match self.policies.retention(tenant)? {
+    pub fn cutoff_ns(&self, tenant: &TenantId, signal: Signal) -> Option<i64> {
+        match self.policies.signal_retention(tenant, signal)? {
             TenantRetention::Infinite => None,
             TenantRetention::Finite(period) => Some(
                 self.now_ns
@@ -173,8 +242,8 @@ impl Cutoffs {
         }
     }
 
-    pub fn is_expired(&self, tenant: &TenantId, timestamp_ns: i64) -> bool {
-        self.cutoff_ns(tenant)
+    pub fn is_expired(&self, tenant: &TenantId, signal: Signal, timestamp_ns: i64) -> bool {
+        self.cutoff_ns(tenant, signal)
             .is_some_and(|cutoff_ns| timestamp_ns < cutoff_ns)
     }
 
@@ -185,14 +254,14 @@ impl Cutoffs {
             && meta
                 .tenants
                 .iter()
-                .all(|segment| self.is_expired(&segment.tenant, segment.max_ts_ns))
+                .all(|segment| self.is_expired(&segment.tenant, Signal::Logs, segment.max_ts_ns))
     }
 
     /// Rows the part holds for tenants whose whole segment has expired.
     pub fn expired_log_rows(&self, meta: &PartMeta) -> u64 {
         meta.tenants
             .iter()
-            .filter(|segment| self.is_expired(&segment.tenant, segment.max_ts_ns))
+            .filter(|segment| self.is_expired(&segment.tenant, Signal::Logs, segment.max_ts_ns))
             .map(|segment| segment.row_count)
             .sum()
     }
@@ -220,7 +289,7 @@ impl Cutoffs {
 
     fn is_zero_retention(&self, tenant: &TenantId) -> bool {
         matches!(
-            self.policies.retention(tenant),
+            self.policies.signal_retention(tenant, Signal::Logs),
             Some(TenantRetention::Finite(period)) if period.is_zero()
         )
     }
@@ -238,7 +307,7 @@ impl Cutoffs {
                 .get(groups)
                 .and_then(|bounds| bounds.iter().max().copied())
                 .unwrap_or(meta.max_ts_ns);
-            self.is_expired(&segment.tenant, segment_max)
+            self.is_expired(&segment.tenant, Signal::Traces, segment_max)
         })
     }
 
@@ -252,7 +321,7 @@ impl Cutoffs {
             && meta
                 .tenants
                 .iter()
-                .all(|segment| self.is_expired(&segment.tenant, meta.max_ts_ns))
+                .all(|segment| self.is_expired(&segment.tenant, Signal::Metrics, meta.max_ts_ns))
     }
 }
 
@@ -311,6 +380,12 @@ struct PolicyDocument {
     /// before it had a version field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_stored_bytes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_retention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace_retention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metric_retention: Option<String>,
     updated_at: String,
 }
 
@@ -396,6 +471,15 @@ impl PolicyStore {
                     })
                 })
                 .transpose()?;
+            let signal_retentions = parse_signal_retentions(
+                &retention,
+                SignalRetentionRequest {
+                    logs: document.log_retention.as_deref(),
+                    traces: document.trace_retention.as_deref(),
+                    metrics: document.metric_retention.as_deref(),
+                },
+            )
+            .map_err(|error| format!("invalid signal retention in {file_name:?}: {error}"))?;
             let updated_at = parse_timestamp(&document.updated_at).map_err(|error| {
                 format!(
                     "invalid updated_at {:?} in {file_name:?}: {error}",
@@ -410,6 +494,7 @@ impl PolicyStore {
                     raw: document.retention,
                     max_stored_bytes,
                     raw_max_stored_bytes: document.max_stored_bytes,
+                    signal_retentions,
                     updated_at,
                 },
             );
@@ -579,8 +664,8 @@ impl TenantPolicy {
     /// Oldest timestamp `tenant` may still read. `None` leaves the requested
     /// range untouched, which is the fail-open behaviour every read path wants
     /// for a tenant the control plane has said nothing about.
-    pub fn query_floor_ns(&self, tenant: &TenantId) -> Option<i64> {
-        self.cutoffs_now()?.cutoff_ns(tenant)
+    pub fn query_floor_ns(&self, tenant: &TenantId, signal: Signal) -> Option<i64> {
+        self.cutoffs_now()?.cutoff_ns(tenant, signal)
     }
 
     pub fn view(&self, tenant: &TenantId) -> Option<PolicyView> {
@@ -616,6 +701,30 @@ impl TenantPolicy {
         raw: &str,
         raw_max_stored_bytes: Option<&str>,
     ) -> Result<PushResult, PolicyError> {
+        self.push_with_signal_retentions(
+            tenant,
+            revision,
+            raw,
+            raw_max_stored_bytes,
+            SignalRetentionRequest::default(),
+        )
+        .await
+    }
+
+    /// [`Self::push`] with per-signal overrides of `raw`. The body is still the
+    /// whole policy: an override left out is cleared.
+    ///
+    /// fn0 is the source of truth for both the policy and its revision
+    /// number; this only fences stale or conflicting writes against the
+    /// revision it was given.
+    pub async fn push_with_signal_retentions(
+        &self,
+        tenant: &TenantId,
+        revision: u64,
+        raw: &str,
+        raw_max_stored_bytes: Option<&str>,
+        raw_signal_retentions: SignalRetentionRequest<'_>,
+    ) -> Result<PushResult, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
                 "per-tenant retention is not enabled".to_string(),
@@ -630,6 +739,13 @@ impl TenantPolicy {
         };
         let max_stored_bytes = match raw_max_stored_bytes.map(parse_storage_limit).transpose() {
             Ok(limit) => limit,
+            Err(error) => {
+                self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(PolicyError::Invalid(error));
+            }
+        };
+        let signal_retentions = match parse_signal_retentions(&retention, raw_signal_retentions) {
+            Ok(signal_retentions) => signal_retentions,
             Err(error) => {
                 self.metrics.push_rejected.fetch_add(1, Ordering::Relaxed);
                 return Err(PolicyError::Invalid(error));
@@ -662,6 +778,9 @@ impl TenantPolicy {
             revision,
             retention: raw.clone(),
             max_stored_bytes: raw_max_stored_bytes.clone(),
+            log_retention: signal_retentions.raw(Signal::Logs),
+            trace_retention: signal_retentions.raw(Signal::Traces),
+            metric_retention: signal_retentions.raw(Signal::Metrics),
             updated_at: format_timestamp(updated_at),
         };
         if let Err(error) = store.put(tenant, &document).await {
@@ -670,26 +789,21 @@ impl TenantPolicy {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(PolicyError::Persist(error));
         }
+        let entry = PolicyEntry {
+            revision,
+            retention,
+            raw,
+            max_stored_bytes,
+            raw_max_stored_bytes,
+            signal_retentions,
+            updated_at,
+        };
+        let view = entry.view();
         self.mutate(|entries| {
-            entries.insert(
-                tenant.clone(),
-                PolicyEntry {
-                    revision,
-                    retention,
-                    raw: raw.clone(),
-                    max_stored_bytes,
-                    raw_max_stored_bytes: raw_max_stored_bytes.clone(),
-                    updated_at,
-                },
-            );
+            entries.insert(tenant.clone(), entry);
         });
         self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
-        Ok(PushResult::Applied(PolicyView {
-            revision,
-            retention: raw,
-            max_stored_bytes: raw_max_stored_bytes,
-            updated_at,
-        }))
+        Ok(PushResult::Applied(view))
     }
 
     pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
@@ -748,6 +862,7 @@ impl TenantPolicy {
                         raw,
                         max_stored_bytes: None,
                         raw_max_stored_bytes: None,
+                        signal_retentions: SignalRetentions::default(),
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -832,6 +947,40 @@ pub fn parse_retention(raw: &str) -> Result<TenantRetention, String> {
     Ok(TenantRetention::Finite(Duration::from_nanos(nanos)))
 }
 
+/// Per-signal overrides of `retention`.
+///
+/// `retention: "0"` is how a tenant is deleted, so it refuses an override that
+/// would keep one of the tenant's signals alive.
+fn parse_signal_retentions(
+    retention: &TenantRetention,
+    request: SignalRetentionRequest<'_>,
+) -> Result<SignalRetentions, String> {
+    let tenant_is_deleted =
+        matches!(retention, TenantRetention::Finite(period) if period.is_zero());
+    let parse = |name: &str, raw: Option<&str>| -> Result<Option<SignalRetention>, String> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let signal_retention = parse_retention(raw).map_err(|error| format!("{name}: {error}"))?;
+        let keeps_data =
+            !matches!(signal_retention, TenantRetention::Finite(period) if period.is_zero());
+        if tenant_is_deleted && keeps_data {
+            return Err(format!(
+                "{name}: a tenant at retention \"0\" is being deleted, so no signal may keep data"
+            ));
+        }
+        Ok(Some(SignalRetention {
+            retention: signal_retention,
+            raw: raw.trim().to_string(),
+        }))
+    };
+    Ok(SignalRetentions {
+        logs: parse("log_retention", request.logs)?,
+        traces: parse("trace_retention", request.traces)?,
+        metrics: parse("metric_retention", request.metrics)?,
+    })
+}
+
 /// Parses a storage limit: a byte size such as `10GiB`, `0`, or the literal
 /// `unlimited`. `"0"` means the tenant may not store anything, mirroring
 /// `retention: "0"`.
@@ -869,6 +1018,89 @@ mod tests {
 
     fn tenant(raw: &str) -> TenantId {
         TenantId::parse(raw).expect("valid tenant id")
+    }
+
+    #[tokio::test]
+    async fn a_signal_override_replaces_the_tenant_retention_for_that_signal_only() {
+        let policy = TenantPolicy::enabled_for_test();
+        policy
+            .push_with_signal_retentions(
+                &tenant("acme"),
+                1,
+                "30d",
+                None,
+                SignalRetentionRequest {
+                    traces: Some("3d"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let now_ns = 100 * 24 * 60 * 60 * 1_000_000_000i64;
+        let cutoffs = policy.cutoffs_at(now_ns).unwrap();
+        let four_days_ago_ns = now_ns - 4 * 24 * 60 * 60 * 1_000_000_000;
+
+        assert!(cutoffs.is_expired(&tenant("acme"), Signal::Traces, four_days_ago_ns));
+        assert!(!cutoffs.is_expired(&tenant("acme"), Signal::Logs, four_days_ago_ns));
+        assert!(!cutoffs.is_expired(&tenant("acme"), Signal::Metrics, four_days_ago_ns));
+        assert_eq!(
+            policy
+                .view(&tenant("acme"))
+                .unwrap()
+                .trace_retention
+                .as_deref(),
+            Some("3d")
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_overrides_survive_a_restart_and_clear_when_omitted() {
+        let store = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(store.clone());
+        policy
+            .push_with_signal_retentions(
+                &tenant("acme"),
+                1,
+                "30d",
+                None,
+                SignalRetentionRequest {
+                    logs: Some("14d"),
+                    traces: Some("3d"),
+                    metrics: None,
+                },
+            )
+            .await
+            .unwrap();
+        let entries = PolicyStore::Remote(store.clone()).load_all().await.unwrap();
+        let restored = entries.get(&tenant("acme")).unwrap().view();
+        assert_eq!(restored.log_retention.as_deref(), Some("14d"));
+        assert_eq!(restored.trace_retention.as_deref(), Some("3d"));
+        assert_eq!(restored.metric_retention, None);
+
+        policy.push(&tenant("acme"), 2, "30d", None).await.unwrap();
+        let entries = PolicyStore::Remote(store).load_all().await.unwrap();
+        let cleared = entries.get(&tenant("acme")).unwrap().view();
+        assert_eq!(cleared.log_retention, None);
+        assert_eq!(cleared.trace_retention, None);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_tenant_cannot_keep_a_signal() {
+        let policy = TenantPolicy::enabled_for_test();
+        let refused = policy
+            .push_with_signal_retentions(
+                &tenant("acme"),
+                1,
+                "0",
+                None,
+                SignalRetentionRequest {
+                    metrics: Some("30d"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(refused, Err(PolicyError::Invalid(_))));
+        assert!(policy.view(&tenant("acme")).is_none());
     }
 
     fn days(count: u64) -> Duration {
@@ -926,7 +1158,7 @@ mod tests {
     #[test]
     fn an_unknown_tenant_never_expires() {
         let policy = TenantPolicy::enabled_for_test();
-        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
+        assert_eq!(policy.query_floor_ns(&tenant("acme"), Signal::Logs), None);
 
         policy.install_for_test(
             [(
@@ -937,11 +1169,11 @@ mod tests {
             .collect(),
         );
         let cutoffs = policy.cutoffs_at(1_000).unwrap();
-        assert_eq!(cutoffs.cutoff_ns(&tenant("acme")), Some(900));
-        assert!(cutoffs.is_expired(&tenant("acme"), 899));
-        assert!(!cutoffs.is_expired(&tenant("acme"), 900));
-        assert_eq!(cutoffs.cutoff_ns(&tenant("hobby")), None);
-        assert!(!cutoffs.is_expired(&tenant("hobby"), i64::MIN));
+        assert_eq!(cutoffs.cutoff_ns(&tenant("acme"), Signal::Logs), Some(900));
+        assert!(cutoffs.is_expired(&tenant("acme"), Signal::Logs, 899));
+        assert!(!cutoffs.is_expired(&tenant("acme"), Signal::Logs, 900));
+        assert_eq!(cutoffs.cutoff_ns(&tenant("hobby"), Signal::Logs), None);
+        assert!(!cutoffs.is_expired(&tenant("hobby"), Signal::Logs, i64::MIN));
     }
 
     #[test]
@@ -950,7 +1182,7 @@ mod tests {
         assert!(!policy.is_enabled());
         assert!(policy.cutoffs_now().is_none());
         assert!(policy.snapshot().is_none());
-        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
+        assert_eq!(policy.query_floor_ns(&tenant("acme"), Signal::Logs), None);
     }
 
     /// The pushed policies are the tenant registry: enabled and empty serves
@@ -1089,9 +1321,12 @@ mod tests {
         let cutoffs = policy.cutoffs_at(1_000).unwrap();
         // The cutoff sits at now, so every query for the tenant empties from
         // the next request onward.
-        assert_eq!(cutoffs.cutoff_ns(&tenant("acme")), Some(1_000));
-        assert!(cutoffs.is_expired(&tenant("acme"), 999));
-        assert!(!cutoffs.is_expired(&tenant("beta"), i64::MIN));
+        assert_eq!(
+            cutoffs.cutoff_ns(&tenant("acme"), Signal::Logs),
+            Some(1_000)
+        );
+        assert!(cutoffs.is_expired(&tenant("acme"), Signal::Logs, 999));
+        assert!(!cutoffs.is_expired(&tenant("beta"), Signal::Logs, i64::MIN));
         assert!(cutoffs.is_zero_retention(&tenant("acme")));
         assert!(!cutoffs.is_zero_retention(&tenant("beta")));
         assert!(!cutoffs.is_zero_retention(&tenant("hobby")));
@@ -1152,7 +1387,11 @@ mod tests {
         policy.push(&tenant("acme"), 1, "7d", None).await.unwrap();
 
         let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
-        let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
+        let floor = || {
+            policy
+                .query_floor_ns(&tenant("acme"), Signal::Logs)
+                .expect("finite")
+        };
 
         // A row written now sits exactly at the floor's far side.
         assert_eq!(floor(), start_ns - seven_days.as_nanos() as i64);
@@ -1164,7 +1403,7 @@ mod tests {
             !policy
                 .cutoffs_now()
                 .unwrap()
-                .is_expired(&tenant("acme"), start_ns),
+                .is_expired(&tenant("acme"), Signal::Logs, start_ns),
             "a row exactly at the cutoff is retained"
         );
 
@@ -1174,7 +1413,7 @@ mod tests {
             policy
                 .cutoffs_now()
                 .unwrap()
-                .is_expired(&tenant("acme"), start_ns),
+                .is_expired(&tenant("acme"), Signal::Logs, start_ns),
             "one nanosecond past the cutoff must expire"
         );
     }
@@ -1193,7 +1432,7 @@ mod tests {
             policy
                 .cutoffs_now()
                 .unwrap()
-                .is_expired(&tenant("acme"), start_ns),
+                .is_expired(&tenant("acme"), Signal::Logs, start_ns),
             "two days in, a one-day plan has passed this row"
         );
 
@@ -1204,7 +1443,7 @@ mod tests {
             !policy
                 .cutoffs_now()
                 .unwrap()
-                .is_expired(&tenant("acme"), start_ns),
+                .is_expired(&tenant("acme"), Signal::Logs, start_ns),
             "the upgrade must apply to data written under the old plan"
         );
     }
@@ -1234,11 +1473,15 @@ mod tests {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         policy.push(&tenant("acme"), 1, "1ms", None).await.unwrap();
-        assert!(policy.query_floor_ns(&tenant("acme")).is_some());
+        assert!(
+            policy
+                .query_floor_ns(&tenant("acme"), Signal::Logs)
+                .is_some()
+        );
 
         policy.remove(&tenant("acme")).await.unwrap();
         assert_eq!(
-            policy.query_floor_ns(&tenant("acme")),
+            policy.query_floor_ns(&tenant("acme"), Signal::Logs),
             None,
             "an unknown tenant is never clamped"
         );
@@ -1280,8 +1523,8 @@ mod tests {
 
         let cutoffs = policy.cutoffs_at(1_000).unwrap();
         assert_eq!(
-            cutoffs.cutoff_ns(&tenant("intern")),
-            cutoffs.cutoff_ns(&tenant("never_pushed")),
+            cutoffs.cutoff_ns(&tenant("intern"), Signal::Logs),
+            cutoffs.cutoff_ns(&tenant("never_pushed"), Signal::Logs),
             "an explicit infinite keeps exactly as much as never being pushed"
         );
     }

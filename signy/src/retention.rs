@@ -436,26 +436,6 @@ async fn retention_once_at(
         }
     }
 
-    if let Some(cache) = remote_cache {
-        match tokio::time::timeout(
-            config.max_retention_runtime,
-            cache
-                .storage
-                .garbage_collect_orphans(config.retention_grace_period),
-        )
-        .await
-        {
-            Ok(Ok(_)) => cache.record_remote_success(),
-            Ok(Err(error)) => {
-                cache.record_remote_failure();
-                return Err(error);
-            }
-            Err(_) => {
-                cache.record_remote_failure();
-                return Err("remote retention garbage collection timed out".to_string());
-            }
-        }
-    }
     tracing::info!(removed, "retention removed expired parts");
     Ok(())
 }

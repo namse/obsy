@@ -27,6 +27,7 @@ pub mod memtable;
 mod merge;
 mod metrics;
 pub mod object_storage;
+mod object_store_gc;
 mod otlp_log;
 mod otlp_tenant;
 pub(crate) mod page_cache;
@@ -51,6 +52,7 @@ mod tenant_quota;
 pub mod test_support;
 mod trace;
 mod trace_ingest;
+mod trace_merge;
 mod trace_part;
 pub mod trace_registry;
 

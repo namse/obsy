@@ -23,7 +23,7 @@ see docs/QUERY_API.md"
         ApiError::from_engine(format!("{TENANT_QUOTA_PREFIX}{}", error.message))
     })?;
     let metrics = state.metrics.clone();
-    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant);
+    let retention_floor_ns = state.tenant_policy.query_floor_ns(&tenant, crate::tenant_policy::Signal::Traces);
     let started = std::time::Instant::now();
     let result = scan_trace_spans(state, tenant, TraceScanTarget::ById(trace_id.clone())).await;
     metrics.observe_query(crate::metrics::QueryEndpoint::TraceById, started.elapsed());
@@ -149,7 +149,7 @@ fn trace_window(
             .unwrap_or(i64::MIN)
     });
     validate_query_range(&state.config, start_ns, end_ns).map_err(ApiError::bad_request)?;
-    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant));
+    let start_ns = clamp_to_retention(start_ns, state.tenant_policy.query_floor_ns(tenant, crate::tenant_policy::Signal::Traces));
     if start_ns > end_ns {
         return Ok(None);
     }

@@ -22,7 +22,7 @@ impl MetadataGuard {
         tenant: &crate::tenant::TenantId,
         window: crate::part::MetadataWindow,
     ) -> Result<Option<Self>, (StatusCode, String)> {
-        let window = window.clamped_to(state.tenant_policy.query_floor_ns(tenant));
+        let window = window.clamped_to(state.tenant_policy.query_floor_ns(tenant, crate::tenant_policy::Signal::Logs));
         // An empty window is a valid question with an empty answer, not an
         // error: a tenant whose retention already passed the requested range
         // asks this on every dashboard refresh.

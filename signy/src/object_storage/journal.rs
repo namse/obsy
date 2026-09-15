@@ -588,6 +588,96 @@ impl ObjectStorage {
         Ok(())
     }
 
+    /// Delete catalog objects that no startup can read any more.
+    ///
+    /// A startup reads the newest snapshot that verifies and replays the
+    /// commits after it, falling back to an older snapshot when the newest one
+    /// does not verify. So two snapshots are kept that verify on both replicas
+    /// and whose digest matches the commit at their generation, together with
+    /// that commit and every commit after it; a single damaged snapshot then
+    /// still leaves a readable catalog. Everything older goes, but only once it
+    /// is older than `min_age`: the Bucket Lock rule on `catalog/` refuses to
+    /// delete anything younger, and `min_age` has to be set above that rule.
+    pub async fn prune_catalog(&self, min_age: std::time::Duration) -> Result<usize, String> {
+        self.prune_catalog_at(min_age, chrono::Utc::now()).await
+    }
+
+    pub(crate) async fn prune_catalog_at(
+        &self,
+        min_age: std::time::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, String> {
+        use futures_util::StreamExt;
+
+        let snapshot_generations = self
+            .catalog_generations(CATALOG_SNAPSHOTS_PREFIX, None)
+            .await?;
+        let mut verified_snapshot_generations = Vec::new();
+        for generation in snapshot_generations.into_iter().rev() {
+            if self.catalog_snapshot_is_intact(generation).await? {
+                verified_snapshot_generations.push(generation);
+                if verified_snapshot_generations.len() == 2 {
+                    break;
+                }
+            }
+        }
+        let [_, oldest_kept_snapshot] = verified_snapshot_generations[..] else {
+            return Ok(0);
+        };
+        let cutoff = now
+            - chrono::Duration::from_std(min_age)
+                .map_err(|error| format!("invalid catalog prune age: {error}"))?;
+
+        let mut removed = 0;
+        for kind in [CATALOG_SNAPSHOTS_PREFIX, CATALOG_COMMITS_PREFIX] {
+            for replica in ["a", "b"] {
+                let prefix = self.path(&format!("{kind}/{replica}"));
+                let mut superseded = Vec::new();
+                let mut stream = self.store.list(Some(&prefix));
+                while let Some(item) = stream.next().await {
+                    let meta = item.map_err(|error| {
+                        format!("failed to list catalog {kind} replica {replica}: {error}")
+                    })?;
+                    let Some(generation) = catalog_generation_from_path(&meta.location) else {
+                        continue;
+                    };
+                    if generation < oldest_kept_snapshot && meta.last_modified < cutoff {
+                        superseded.push(meta.location);
+                    }
+                }
+                drop(stream);
+                for location in superseded {
+                    match self.store.delete(&location).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => removed += 1,
+                        Err(error) => {
+                            return Err(format!(
+                                "failed to delete superseded catalog object {location}: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Whether both replicas of a snapshot read back identical and valid, and
+    /// the snapshot closes over the commit that is really at its generation.
+    async fn catalog_snapshot_is_intact(&self, generation: u64) -> Result<bool, String> {
+        let first = self.load_catalog_snapshot_replica("a", generation).await;
+        let second = self.load_catalog_snapshot_replica("b", generation).await;
+        let (Ok(Some(first)), Ok(Some(second))) = (first, second) else {
+            return Ok(false);
+        };
+        if first.bytes != second.bytes {
+            return Ok(false);
+        }
+        match self.load_catalog_commit(generation).await {
+            Ok(commit) => Ok(commit.digest == first.value.through_digest),
+            Err(_) => Ok(false),
+        }
+    }
+
     pub(crate) async fn commit_catalog_mutation(
         &self,
         mut mutation: CatalogMutation,

@@ -122,7 +122,7 @@
 
         // A 200 is a promise that the policy survives a restart.
         assert_eq!(storage.load_tenant_policies().await.unwrap().len(), 1);
-        assert!(policy.query_floor_ns(&tenant("acme")).is_some());
+        assert!(policy.query_floor_ns(&tenant("acme"), crate::tenant_policy::Signal::Logs).is_some());
 
         let (status, body) = call(&state, "GET", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::OK);
@@ -134,7 +134,7 @@
         let (status, _) = call(&state, "DELETE", RETENTION_URI, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            policy.query_floor_ns(&tenant("acme")),
+            policy.query_floor_ns(&tenant("acme"), crate::tenant_policy::Signal::Logs),
             None,
             "DELETE returns the tenant to unknown, which keeps its data"
         );
@@ -228,7 +228,7 @@
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            policy.query_floor_ns(&tenant("acme")),
+            policy.query_floor_ns(&tenant("acme"), crate::tenant_policy::Signal::Logs),
             None,
             "a policy that is not durable is not applied either"
         );
@@ -296,7 +296,7 @@
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["retention"],
             "30d"
         );
-        let floor_ns = policy.query_floor_ns(&tenant("acme")).unwrap();
+        let floor_ns = policy.query_floor_ns(&tenant("acme"), crate::tenant_policy::Signal::Logs).unwrap();
         let thirty_days_ns = 30 * 24 * 60 * 60 * 1_000_000_000i64;
         let elapsed = crate::tenant_policy::now_ns() - floor_ns;
         assert!(
@@ -323,8 +323,8 @@
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(policy.query_floor_ns(&tenant("acme")), None);
-        assert_eq!(policy.query_floor_ns(&tenant("never-pushed")), None);
+        assert_eq!(policy.query_floor_ns(&tenant("acme"), crate::tenant_policy::Signal::Logs), None);
+        assert_eq!(policy.query_floor_ns(&tenant("never-pushed"), crate::tenant_policy::Signal::Logs), None);
     }
 
     /// `/metrics` is one positional `format!` over roughly forty-five counters,

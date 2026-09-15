@@ -535,6 +535,7 @@ impl ObjectStorage {
         &self,
         traces_root: &Path,
     ) -> Result<TraceManifest, String> {
+        self.replay_trace_compactions(traces_root).await?;
         let manifest = self.restore_trace_catalog(traces_root).await?;
         validate_cache_tree_no_symlinks(traces_root)?;
         let active: HashMap<&str, &TraceManifestPart> = manifest
@@ -569,6 +570,51 @@ impl ObjectStorage {
             self.publish_trace_parts(&unpublished).await?;
         }
         self.restore_trace_catalog(traces_root).await
+    }
+
+    /// Finishes every trace compaction a crash interrupted, the way the pass
+    /// would have: the replacement swapped in for its inputs, idempotently,
+    /// then the local inputs removed and the record cleared. A replacement
+    /// that never became durable is removed with its record and the inputs
+    /// stay. Runs before the unpublished-part scan, which would otherwise
+    /// publish a replacement beside the inputs it replaces.
+    async fn replay_trace_compactions(&self, traces_root: &Path) -> Result<(), String> {
+        for (path, record) in crate::trace_merge::read_records(traces_root)? {
+            let mut new_parts = Vec::new();
+            let mut new_dirs = Vec::new();
+            let mut durable = true;
+            for relative in &record.new {
+                let dir = crate::trace_merge::record_dir(traces_root, relative)?;
+                match crate::trace_part::load_trace_part(&dir)
+                    .and_then(|part| TracePartReader::open(part.clone()).map(|_| part))
+                {
+                    Ok(part) => new_parts.push(part),
+                    Err(_) => durable = false,
+                }
+                if dir.exists() {
+                    new_dirs.push(dir);
+                }
+            }
+            if durable {
+                let mut input_descriptors = Vec::new();
+                let mut input_dirs = Vec::new();
+                for relative in &record.inputs {
+                    input_dirs.push(crate::trace_merge::record_dir(traces_root, relative)?);
+                    input_descriptors.push(crate::trace_merge::record_input_descriptor(relative)?);
+                }
+                match self.replace_trace_parts(&new_parts, &input_descriptors).await {
+                    Ok(_) => crate::part::remove_part_dirs(&input_dirs)?,
+                    Err(error) if is_inputs_changed_error(&error) => {
+                        crate::part::remove_part_dirs(&new_dirs)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                crate::part::remove_part_dirs(&new_dirs)?;
+            }
+            crate::trace_merge::remove_record(&path)?;
+        }
+        Ok(())
     }
 
     pub async fn restore_trace_parts(

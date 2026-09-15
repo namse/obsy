@@ -23,6 +23,14 @@ struct RetentionRequest {
     /// tenant — the body is the whole policy, not a patch of it.
     #[serde(default)]
     max_stored_bytes: Option<String>,
+    /// Per-signal overrides of `retention`, each optional and each cleared when
+    /// omitted, for the same reason as `max_stored_bytes`.
+    #[serde(default)]
+    log_retention: Option<String>,
+    #[serde(default)]
+    trace_retention: Option<String>,
+    #[serde(default)]
+    metric_retention: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -32,6 +40,12 @@ pub struct RetentionResponse {
     retention: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_stored_bytes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_retention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_retention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric_retention: Option<String>,
     updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<PushOutcome>,
@@ -43,6 +57,26 @@ enum PushOutcome {
     Applied,
     Duplicate,
     Stale,
+}
+
+impl RetentionResponse {
+    fn new(
+        tenant: &TenantId,
+        view: crate::tenant_policy::PolicyView,
+        result: Option<PushOutcome>,
+    ) -> Self {
+        Self {
+            tenant: tenant.as_str().to_string(),
+            revision: view.revision,
+            retention: view.retention,
+            max_stored_bytes: view.max_stored_bytes,
+            log_retention: view.log_retention,
+            trace_retention: view.trace_retention,
+            metric_retention: view.metric_retention,
+            updated_at: rfc3339(view.updated_at),
+            result,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -71,11 +105,16 @@ pub async fn put_retention(
     })?;
     let result = state
         .tenant_policy
-        .push(
+        .push_with_signal_retentions(
             &tenant,
             request.revision,
             &request.retention,
             request.max_stored_bytes.as_deref(),
+            crate::tenant_policy::SignalRetentionRequest {
+                logs: request.log_retention.as_deref(),
+                traces: request.trace_retention.as_deref(),
+                metrics: request.metric_retention.as_deref(),
+            },
         )
         .await
         .map_err(into_http)?;
@@ -85,14 +124,7 @@ pub async fn put_retention(
         crate::tenant_policy::PushResult::Stale(view) => (view, PushOutcome::Stale),
     };
     tracing::info!(%tenant, retention = %view.retention, "tenant policy updated");
-    Ok(Json(RetentionResponse {
-        tenant: tenant.as_str().to_string(),
-        revision: view.revision,
-        retention: view.retention,
-        max_stored_bytes: view.max_stored_bytes,
-        updated_at: rfc3339(view.updated_at),
-        result: Some(outcome),
-    }))
+    Ok(Json(RetentionResponse::new(&tenant, view, Some(outcome))))
 }
 
 pub async fn get_retention(
@@ -106,14 +138,7 @@ pub async fn get_retention(
             format!("no retention policy for tenant {tenant}"),
         )
     })?;
-    Ok(Json(RetentionResponse {
-        tenant: tenant.as_str().to_string(),
-        revision: view.revision,
-        retention: view.retention,
-        max_stored_bytes: view.max_stored_bytes,
-        updated_at: rfc3339(view.updated_at),
-        result: None,
-    }))
+    Ok(Json(RetentionResponse::new(&tenant, view, None)))
 }
 
 /// `GET …/admin/tenants` — every tenant this instance serves, with the policy
@@ -131,14 +156,7 @@ pub async fn list_tenants(
         .map(|policies| {
             policies
                 .views()
-                .map(|(tenant, view)| RetentionResponse {
-                    tenant: tenant.as_str().to_string(),
-                    revision: view.revision,
-                    retention: view.retention,
-                    max_stored_bytes: view.max_stored_bytes,
-                    updated_at: rfc3339(view.updated_at),
-                    result: None,
-                })
+                .map(|(tenant, view)| RetentionResponse::new(tenant, view, None))
                 .collect()
         })
         .unwrap_or_default();

@@ -127,7 +127,14 @@ pub fn recover_with_marks(
     cleanup_tmp(&metrics_root)?;
     // Before any registry looks at the directory: a compaction that crashed
     // between its commit record and its input removal must resolve one way.
-    crate::series_merge::recover_local_compactions(&metrics_root)?;
+    // With an object store the manifest decides instead: resolving a record
+    // here would delete it before the reconcile can replay it, and a crash
+    // before the manifest swap would then publish the replacement beside the
+    // inputs the reconcile restores.
+    if config.object_store_url.is_none() {
+        crate::series_merge::recover_local_compactions(&metrics_root)?;
+        crate::trace_merge::recover_local_compactions(&traces_root)?;
+    }
 
     let wal_path = config.data_dir.join("journal.wal");
     let ckpt_path = config.data_dir.join("journal.ckpt");
@@ -601,6 +608,35 @@ pub async fn run(config: Arc<Config>) {
                     }
                 }
             }
+        }));
+    }
+
+    {
+        let trace_registry = trace_registry.clone();
+        let deletion_lock = parts.deletion_lock();
+        let cache = remote_cache.clone();
+        let config = config.clone();
+        let task_health = merge_healthy.clone();
+        let drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
+            crate::trace_merge::compact_loop(
+                trace_registry,
+                deletion_lock,
+                cache,
+                config,
+                task_health,
+                drain_rx,
+            )
+            .await;
+        }));
+    }
+
+    if let Some(cache) = remote_cache.clone() {
+        let config = config.clone();
+        let metrics = metrics.clone();
+        let drain_rx = shutdown.subscribe();
+        worker_handles.push(tokio::spawn(async move {
+            crate::object_store_gc::object_store_gc_loop(cache, config, metrics, drain_rx).await;
         }));
     }
 

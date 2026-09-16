@@ -10,25 +10,26 @@
 //! [`COMPACT_MIN_PARTS`] parts.
 //!
 //! **Crash safety is a commit record**, `metrics_root/.compact/<id>.json`,
-//! written after the replacement part is durable and before any input is
-//! removed. Local mode replays it in `startup::recover_with_signals`; remote
+//! written durably before the replacement part is created and before any input
+//! is removed. Local mode replays it in `startup::recover_with_signals`; remote
 //! mode replays it in `reconcile_metric_local_cache`, where the idempotent
 //! manifest replacement (`publish_metric_parts(added, removed)`) makes every
 //! crash window converge on the same end state — which is the same shape the
 //! log merge's tombstone replay has, carried in a sidecar directory because a
 //! metric part has no row-group tombstone to ride in.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
-use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
+use crate::compaction_tier::{select_tier, TierCandidate, TierPolicy};
 use crate::config::Config;
-use crate::object_storage::{MetricManifestPart, RemoteCache, is_inputs_changed_error};
+use crate::object_storage::{is_inputs_changed_error, MetricManifestPart, RemoteCache};
 use crate::series_part::{self, SeriesPartReader};
 use crate::series_registry::SeriesRegistry;
 use crate::shutdown::wait_for_drain;
@@ -109,14 +110,23 @@ fn write_record(metrics_root: &Path, id: &str, record: &CompactRecord) -> Result
     let dir = compact_dir(metrics_root);
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let path = dir.join(format!("{id}.json"));
+    let temporary = dir.join(format!(".{id}.{}.tmp", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
-    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    std::fs::File::open(&path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    std::fs::File::open(&dir)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
     Ok(path)
 }
 
@@ -189,6 +199,13 @@ pub fn recover_local_compactions(metrics_root: &Path) -> Result<(), String> {
                 .map(|relative| record_dir(metrics_root, relative))
                 .collect::<Result<Vec<_>, _>>()?;
             crate::part::remove_part_dirs(&dirs)?;
+        } else {
+            let dirs = record
+                .new
+                .iter()
+                .map(|relative| record_dir(metrics_root, relative))
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::part::remove_part_dirs(&dirs)?;
         }
         remove_record(&path)?;
     }
@@ -206,19 +223,13 @@ pub async fn compact_once(
         return Ok(false);
     };
 
-    // Everything from here to `write_record` is synchronous, so the arena
+    // Everything from here to the record write is synchronous, so the arena
     // guard is safe to hold across it and is dropped before the first await.
     let arena = crate::memprof::enter(crate::memprof::Arena::Merge);
 
     // Input catalogs and sample chunks are merged one head at a time. The
     // streaming writer preserves the same tenant/labels ordering and stable
     // duplicate-timestamp order as the old snapshot materialisation path.
-    let new_parts = series_part::compact_series_parts(&inputs, metrics_root)
-        .map_err(|error| format!("compaction failed to write its replacement part: {error}"))?;
-    if new_parts.is_empty() {
-        return Ok(false);
-    }
-
     let input_descriptors: Vec<MetricManifestPart> = inputs
         .iter()
         .map(|reader| MetricManifestPart {
@@ -230,17 +241,39 @@ pub async fn compact_once(
         .iter()
         .map(|reader| reader.part().dir.clone())
         .collect();
+    let partition = inputs[0].part().meta.partition.clone();
+    let output_id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
     let record = CompactRecord {
-        new: new_parts
-            .iter()
-            .map(|part| relative_dir(metrics_root, &part.dir))
-            .collect::<Result<_, _>>()?,
+        new: vec![format!("{partition}/{output_id}")],
         inputs: input_dirs
             .iter()
             .map(|dir| relative_dir(metrics_root, dir))
             .collect::<Result<_, _>>()?,
     };
-    let record_path = write_record(metrics_root, &new_parts[0].meta.id, &record)?;
+    // The intent is durable before the replacement can become visible. A
+    // restart can therefore safely discard a partial output and retain all
+    // inputs, including a crash between record creation and the first write.
+    let record_path = write_record(metrics_root, &output_id, &record)?;
+    let new_parts =
+        match series_part::compact_series_parts_with_id(&inputs, metrics_root, &output_id) {
+            Ok(parts) => parts,
+            Err(error) => {
+                remove_record(&record_path)?;
+                return Err(format!(
+                    "compaction failed to write its replacement part: {error}"
+                ));
+            }
+        };
+    if new_parts.len() != 1 || new_parts[0].meta.id != output_id {
+        let _ = crate::part::remove_part_dirs(
+            &new_parts
+                .iter()
+                .map(|part| part.dir.clone())
+                .collect::<Vec<_>>(),
+        );
+        remove_record(&record_path)?;
+        return Err("metric compaction wrote an unexpected replacement id".to_string());
+    }
     drop(arena);
 
     if let Some(cache) = remote {
@@ -363,8 +396,8 @@ mod tests {
 
     use super::*;
     use crate::series::{
-        METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable,
-        SeriesSnapshot, SnapshotSeries,
+        MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable, SeriesSnapshot,
+        SnapshotSeries, METRIC_NAME_LABEL,
     };
     use crate::tenant::test_tenant;
 
@@ -502,7 +535,8 @@ mod tests {
             flush_one_part(&root, &series, 1_772_000_000_000_000_000, 4);
         }
         let registry = registry_over(&root);
-        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).expect("the tier is complete");
+        let inputs =
+            select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).expect("the tier is complete");
         let mut expected = Vec::new();
         for reader in &inputs {
             expected.extend(
@@ -632,7 +666,9 @@ mod tests {
 
         assert!(manifest.parts.is_empty());
         assert!(read_records(&root).unwrap().is_empty());
-        assert!(series_part::discover_series_parts(&root).unwrap().is_empty());
+        assert!(series_part::discover_series_parts(&root)
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(&data_dir).ok();
     }
 
@@ -652,6 +688,30 @@ mod tests {
         recover_local_compactions(&root).unwrap();
 
         assert!(input_dir.exists(), "the inputs survive an unfinished pass");
+        assert!(read_records(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_partial_replacement_is_removed_before_registry_restart() {
+        let root = temp_root("partial-replacement");
+        let series = labels("queue_depth", "a");
+        flush_one_part(&root, &series, 1_772_000_000_000_000_000, 5);
+        let registry = registry_over(&root);
+        let input_dir = registry.snapshot()[0].part().dir.clone();
+        let replacement = root.join("2026-02-25/partial-output");
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("truncated.json"), b"partial").unwrap();
+        let record = CompactRecord {
+            new: vec![relative_dir(&root, &replacement).unwrap()],
+            inputs: vec![relative_dir(&root, &input_dir).unwrap()],
+        };
+        write_record(&root, "partial-output", &record).unwrap();
+
+        recover_local_compactions(&root).unwrap();
+
+        assert!(input_dir.exists(), "the inputs survive a partial output");
+        assert!(!replacement.exists(), "the partial output is rolled back");
         assert!(read_records(&root).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }

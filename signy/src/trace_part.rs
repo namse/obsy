@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -218,6 +218,18 @@ pub fn flush_trace_spans(
     traces_root: &Path,
     row_group_size: usize,
 ) -> io::Result<Vec<TracePart>> {
+    flush_trace_spans_with_id(spans, traces_root, row_group_size, None)
+}
+
+/// Flush one compaction partition using an id that was recorded durably before
+/// the replacement files were created. The regular flush path keeps generating
+/// ids internally because it may produce one part per partition.
+pub fn flush_trace_spans_with_id(
+    spans: &[TraceSpan],
+    traces_root: &Path,
+    row_group_size: usize,
+    forced_id: Option<&str>,
+) -> io::Result<Vec<TracePart>> {
     if spans.is_empty() {
         return Ok(Vec::new());
     }
@@ -235,6 +247,12 @@ pub fn flush_trace_spans(
             .or_default()
             .push(span);
     }
+    if forced_id.is_some() && by_partition.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a forced trace compaction id requires one partition",
+        ));
+    }
 
     let mut parts = Vec::new();
     let mut committed_dirs = Vec::new();
@@ -249,7 +267,18 @@ pub fn flush_trace_spans(
                 .then_with(|| left.start_time_ns.cmp(&right.start_time_ns))
                 .then_with(|| left.span_id.cmp(&right.span_id))
         });
-        let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
+        let id = forced_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4()));
+        if let Some(forced_id) = forced_id {
+            let expected_prefix = format!("{}-", partition.replace('-', ""));
+            if !forced_id.starts_with(&expected_prefix) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "trace compaction output id does not match its partition",
+                ));
+            }
+        }
         let tmp_dir = traces_root.join(".tmp").join(&id);
         let final_dir = traces_root.join(&partition).join(&id);
         let result = (|| -> io::Result<TracePart> {
@@ -972,12 +1001,10 @@ mod tests {
             .map(|prefix| prefix.repeat(16))
             .find(|id| !reader.may_match_trace_id(&test_tenant(), id))
             .expect("test ID should be absent from the small bloom");
-        assert!(
-            reader
-                .query_trace_id(&test_tenant(), &negative)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reader
+            .query_trace_id(&test_tenant(), &negative)
+            .unwrap()
+            .is_empty());
         let result = reader
             .query_trace_id(&test_tenant(), &"01".repeat(16))
             .unwrap();
@@ -994,11 +1021,9 @@ mod tests {
         fs::remove_file(part.data_path()).unwrap();
         let reader = TracePartReader::open_cached(load_trace_part(&part.dir).unwrap()).unwrap();
         assert!(reader.may_match_trace_id(&test_tenant(), &"01".repeat(16)));
-        assert!(
-            reader
-                .query_trace_id(&test_tenant(), &"01".repeat(16))
-                .is_err()
-        );
+        assert!(reader
+            .query_trace_id(&test_tenant(), &"01".repeat(16))
+            .is_err());
     }
 
     fn tenant_spans(tenant: &str, trace_byte: u8, start_ns: u64) -> Vec<TraceSpan> {
@@ -1049,12 +1074,10 @@ mod tests {
         // (`may_match_trace_id` is a bloom hint and may say yes; the read
         // itself is what has to be empty.)
         assert!(!reader.may_match_trace_id(&outsider, &globex_trace));
-        assert!(
-            reader
-                .query_trace_id(&acme, &globex_trace)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reader
+            .query_trace_id(&acme, &globex_trace)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             reader.query_trace_id(&globex, &globex_trace).unwrap().len(),
             1

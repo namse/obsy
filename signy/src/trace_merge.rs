@@ -14,25 +14,26 @@
 //! restored first, because eviction may already have dropped them.
 //!
 //! **Crash safety is a commit record**, `traces_root/.compact/<id>.json`,
-//! written after the replacement is durable and before any input is removed.
-//! Local mode resolves it before the registry loads; remote mode replays it in
+//! written durably before the replacement is created and before any input is
+//! removed. Local mode resolves it before the registry loads; remote mode replays it in
 //! `reconcile_trace_local_cache`, where the manifest replacement is
 //! idempotent. Input objects are left to the orphan collector rather than
 //! deleted here, so a query that planned against an input before the
 //! replacement landed can still restore it for the length of the grace period.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
-use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
+use crate::compaction_tier::{select_tier, TierCandidate, TierPolicy};
 use crate::config::Config;
-use crate::object_storage::{RemoteCache, TraceManifestPart, is_inputs_changed_error};
+use crate::object_storage::{is_inputs_changed_error, RemoteCache, TraceManifestPart};
 use crate::shutdown::wait_for_drain;
 use crate::trace_part::{self, TracePartReader};
 use crate::trace_registry::TraceRegistry;
@@ -109,14 +110,23 @@ fn write_record(traces_root: &Path, id: &str, record: &CompactRecord) -> Result<
     let dir = compact_dir(traces_root);
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let path = dir.join(format!("{id}.json"));
+    let temporary = dir.join(format!(".{id}.{}.tmp", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
-    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    std::fs::File::open(&path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    std::fs::File::open(&dir)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
     Ok(path)
 }
 
@@ -290,7 +300,8 @@ pub async fn compact_once(
     config: &Config,
 ) -> Result<bool, String> {
     let _deletion_guard = deletion_lock.read_owned().await;
-    let Some(inputs) = select_inputs(&registry.snapshot(), crate::clock::Clock::system().now_ns()) else {
+    let Some(inputs) = select_inputs(&registry.snapshot(), crate::clock::Clock::system().now_ns())
+    else {
         return Ok(false);
     };
     if !inputs_still_registered(registry, &inputs) {
@@ -313,12 +324,6 @@ pub async fn compact_once(
     let arena = crate::memprof::enter(crate::memprof::Arena::Merge);
     let spans = read_all_spans(&inputs)?;
     let span_count = spans.len();
-    let new_parts = trace_part::flush_trace_spans(&spans, traces_root, config.row_group_size)
-        .map_err(|error| format!("trace compaction failed to write its replacement: {error}"))?;
-    drop(spans);
-    if new_parts.is_empty() {
-        return Ok(false);
-    }
 
     let input_descriptors: Vec<TraceManifestPart> = inputs
         .iter()
@@ -331,17 +336,44 @@ pub async fn compact_once(
         .iter()
         .map(|reader| reader.part().dir.clone())
         .collect();
+    let partition = inputs[0].part().meta.partition.clone();
+    let output_id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
     let record = CompactRecord {
-        new: new_parts
-            .iter()
-            .map(|part| relative_dir(traces_root, &part.dir))
-            .collect::<Result<_, _>>()?,
+        new: vec![format!("{partition}/{output_id}")],
         inputs: input_dirs
             .iter()
             .map(|dir| relative_dir(traces_root, dir))
             .collect::<Result<_, _>>()?,
     };
-    let record_path = write_record(traces_root, &new_parts[0].meta.id, &record)?;
+    // The intent is durable before the replacement can become visible. A
+    // restart can therefore discard a partial output and retain all inputs,
+    // including a crash between record creation and the first write.
+    let record_path = write_record(traces_root, &output_id, &record)?;
+    let new_parts = match trace_part::flush_trace_spans_with_id(
+        &spans,
+        traces_root,
+        config.row_group_size,
+        Some(&output_id),
+    ) {
+        Ok(parts) => parts,
+        Err(error) => {
+            remove_record(&record_path)?;
+            return Err(format!(
+                "trace compaction failed to write its replacement: {error}"
+            ));
+        }
+    };
+    drop(spans);
+    if new_parts.len() != 1 || new_parts[0].meta.id != output_id {
+        let _ = crate::part::remove_part_dirs(
+            &new_parts
+                .iter()
+                .map(|part| part.dir.clone())
+                .collect::<Vec<_>>(),
+        );
+        remove_record(&record_path)?;
+        return Err("trace compaction wrote an unexpected replacement id".to_string());
+    }
     drop(arena);
 
     if let Some(cache) = remote {
@@ -443,7 +475,7 @@ mod tests {
 
     use super::*;
     use crate::tenant::test_tenant;
-    use crate::trace::{TraceSpan, normalize_request};
+    use crate::trace::{normalize_request, TraceSpan};
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
@@ -583,17 +615,15 @@ mod tests {
             ..Config::default()
         };
 
-        assert!(
-            compact_once(
-                &registry,
-                Arc::new(tokio::sync::RwLock::new(())),
-                &traces_root,
-                Some(&cache),
-                &config,
-            )
-            .await
-            .unwrap()
-        );
+        assert!(compact_once(
+            &registry,
+            Arc::new(tokio::sync::RwLock::new(())),
+            &traces_root,
+            Some(&cache),
+            &config,
+        )
+        .await
+        .unwrap());
 
         let manifest = storage.load_trace_manifest().await.unwrap();
         assert_eq!(manifest.generation, generation_before + 1);
@@ -714,6 +744,30 @@ mod tests {
         recover_local_compactions(&root).unwrap();
 
         assert!(input_dir.exists(), "the inputs survive an unfinished pass");
+        assert!(read_records(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recovery_removes_a_partial_replacement_before_registry_restart() {
+        let root = temp_root("recover-partial");
+        flush_one_part(&root, 0);
+        let registry =
+            TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(()))).unwrap();
+        let input_dir = registry.snapshot()[0].part().dir.clone();
+        let replacement = root.join("2026-02-25/partial-output");
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("truncated.json"), b"partial").unwrap();
+        let record = CompactRecord {
+            new: vec![relative_dir(&root, &replacement).unwrap()],
+            inputs: vec![relative_dir(&root, &input_dir).unwrap()],
+        };
+        write_record(&root, "partial-output", &record).unwrap();
+
+        recover_local_compactions(&root).unwrap();
+
+        assert!(input_dir.exists(), "the inputs survive a partial output");
+        assert!(!replacement.exists(), "the partial output is rolled back");
         assert!(read_records(&root).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }

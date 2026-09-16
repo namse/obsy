@@ -412,9 +412,26 @@ pub fn flush_series_snapshot(
 /// streams. Consequently the live sample state is one Gorilla chunk and one
 /// sample per input part, independent of the number of series in the group.
 /// The output format is the same as [`flush_series_snapshot`].
+#[allow(dead_code)]
 pub fn compact_series_parts(
     readers: &[std::sync::Arc<SeriesPartReader>],
     metrics_root: &Path,
+) -> io::Result<Vec<SeriesPart>> {
+    if readers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let partition = readers[0].part().meta.partition.clone();
+    let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
+    compact_series_parts_with_id(readers, metrics_root, &id)
+}
+
+/// Re-flush a compaction group using an id that was recorded durably before
+/// any replacement files were created. That ordering makes a restart able to
+/// distinguish an unfinished output from a committed one.
+pub fn compact_series_parts_with_id(
+    readers: &[std::sync::Arc<SeriesPartReader>],
+    metrics_root: &Path,
+    id: &str,
 ) -> io::Result<Vec<SeriesPart>> {
     if readers.is_empty() {
         return Ok(Vec::new());
@@ -430,16 +447,22 @@ pub fn compact_series_parts(
         ));
     }
 
+    let expected_prefix = format!("{}-", partition.replace('-', ""));
+    if !id.starts_with(&expected_prefix) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "metric compaction output id does not match its partition",
+        ));
+    }
     fs::create_dir_all(metrics_root.join(".tmp"))?;
-    let id = format!("{}-{}", partition.replace('-', ""), uuid::Uuid::new_v4());
-    let tmp_dir = metrics_root.join(".tmp").join(&id);
-    let final_dir = metrics_root.join(&partition).join(&id);
+    let tmp_dir = metrics_root.join(".tmp").join(id);
+    let final_dir = metrics_root.join(&partition).join(id);
     let result = (|| -> io::Result<SeriesPart> {
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir)?;
         }
         fs::create_dir_all(&tmp_dir)?;
-        write_streaming_series_part_files(&tmp_dir, &id, &partition, readers)?;
+        write_streaming_series_part_files(&tmp_dir, id, &partition, readers)?;
         if let Some(parent) = final_dir.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1788,7 +1811,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::{METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesMemTable};
+    use crate::series::{MetricSample, MetricValue, SampleKind, SeriesMemTable, METRIC_NAME_LABEL};
     use crate::tenant::test_tenant;
 
     fn labels(name: &str, instance: &str) -> SeriesLabels {
@@ -1942,12 +1965,11 @@ mod tests {
         // The quota census: both tenants have non-empty, disjoint extents.
         let part = reader.part();
         assert_eq!(part.meta.tenants.len(), 2);
-        assert!(
-            part.meta
-                .tenants
-                .iter()
-                .all(|segment| !segment.bytes.is_empty())
-        );
+        assert!(part
+            .meta
+            .tenants
+            .iter()
+            .all(|segment| !segment.bytes.is_empty()));
         assert!(part.meta.tenants[0].bytes.end <= part.meta.tenants[1].bytes.start);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2310,11 +2332,9 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         fs::write(&path, bytes).unwrap();
-        assert!(
-            load_series_part(&parts[0].dir)
-                .unwrap_err()
-                .contains("checksum")
-        );
+        assert!(load_series_part(&parts[0].dir)
+            .unwrap_err()
+            .contains("checksum"));
         std::fs::remove_dir_all(&root).ok();
     }
 

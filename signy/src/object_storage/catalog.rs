@@ -817,9 +817,10 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Ok(())
     }
 
-    /// Store one tenant policy at its next monotonic revision. The policy
-    /// body carries the revision for restart visibility, while the object
-    /// version supplies the cross-process CAS that a local mutex cannot.
+    /// Store one tenant policy at a greater monotonic revision. Project queue
+    /// messages may skip revisions; the policy body carries the revision for
+    /// restart visibility, while the object version supplies the cross-process
+    /// CAS that a local mutex cannot.
     pub async fn put_tenant_policy_revision(
         &self,
         tenant: &str,
@@ -854,7 +855,7 @@ single-process development store use a file:// URL, which opts out of CAS delibe
             if current_revision == revision && current_body == body {
                 return Ok(());
             }
-            if revision != current_revision + 1 {
+            if revision <= current_revision {
                 return Err(format!(
                     "tenant policy revision conflict for {tenant}: current={current_revision}, requested={revision}"
                 ));
@@ -874,11 +875,6 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                     format!("failed to update the policy for tenant {tenant}: {error}")
                 })
         } else {
-            if revision != 1 {
-                return Err(format!(
-                    "tenant policy revision conflict for {tenant}: current=0, requested={revision}"
-                ));
-            }
             self.store
                 .put_opts(
                     &path,

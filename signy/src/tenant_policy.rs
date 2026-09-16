@@ -140,6 +140,21 @@ impl PolicyEntry {
     }
 }
 
+/// Whether a push at the same revision as the stored entry carries the exact
+/// same policy body — the only case an equal revision is allowed to repeat.
+fn same_policy_document(
+    entry: &PolicyEntry,
+    raw: &str,
+    raw_max_stored_bytes: Option<&String>,
+    signal_retentions: &SignalRetentions,
+) -> bool {
+    entry.raw == raw
+        && entry.raw_max_stored_bytes.as_ref() == raw_max_stored_bytes
+        && [Signal::Logs, Signal::Traces, Signal::Metrics]
+            .into_iter()
+            .all(|signal| entry.signal_retentions.raw(signal) == signal_retentions.raw(signal))
+}
+
 /// One tenant's policy as the admin endpoints report it.
 #[derive(Debug)]
 pub struct PolicyView {
@@ -774,7 +789,12 @@ impl TenantPolicy {
                     return Ok(PushResult::Stale(current.view()));
                 }
                 std::cmp::Ordering::Equal => {
-                    if current.raw == raw && current.raw_max_stored_bytes == raw_max_stored_bytes {
+                    if same_policy_document(
+                        &current,
+                        &raw,
+                        raw_max_stored_bytes.as_ref(),
+                        &signal_retentions,
+                    ) {
                         return Ok(PushResult::Duplicate(current.view()));
                     }
                     return Err(PolicyError::RevisionConflict { revision });

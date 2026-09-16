@@ -37,7 +37,6 @@ the first enables conditional catalog creation and the second asserts that an R2
 | Variable | Default | Description |
 |---|---|---|
 | `SIGNY_MISSING_TENANT` | unset (reject) | Tenant a **read** without an `X-Tenant-Id` header is filed under. **Unset — the default — rejects such reads with 400**: behind a gateway a missing header is the gateway failing, which should fail loudly rather than quietly pool everyone's data. Set it (any valid tenant id) for single-tenant deployments where nothing mints the header. Writes are unaffected — their tenant is the `tenant.id` resource attribute, and an export naming none is dropped, since a default there would pool every misconfigured exporter into one tenant |
-| `SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES` | none (unbounded) | Bytes a tenant may keep stored, for tenants with no pushed `max_stored_bytes`. A plain byte count, or `off`. **Set this before opening a free tier**: a tenant nothing was pushed for is one nobody sold anything to, and unbounded means the first of them decides how much disk the rest get |
 | `SIGNY_MAX_CONCURRENT_QUERIES_PER_TENANT` | 4 | Queries one tenant may run at once, so one tenant cannot take every permit of the shared query semaphore |
 
 **The pushed policies are the tenant registry**: only tenants the control plane

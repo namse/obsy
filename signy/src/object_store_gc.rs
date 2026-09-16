@@ -146,7 +146,9 @@ async fn prune_catalog_once(
     metrics
         .catalog_objects_pruned
         .fetch_add(pruned as u64, Ordering::Relaxed);
-    metrics.catalog_prune_success.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .catalog_prune_success
+        .fetch_add(1, Ordering::Relaxed);
     if pruned > 0 {
         tracing::info!(pruned, "catalog pruning removed objects");
     }

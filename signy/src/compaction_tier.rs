@@ -170,7 +170,9 @@ mod tests {
         let selected = select_tier(&candidates, &policy(), now_ns).expect("a full tier compacts");
         assert_eq!(selected.len(), 8);
         assert!(
-            selected.iter().all(|index| candidates[*index].bytes == 7 * 1024),
+            selected
+                .iter()
+                .all(|index| candidates[*index].bytes == 7 * 1024),
             "and it compacts the small parts alone"
         );
     }
@@ -181,7 +183,11 @@ mod tests {
         let policy = policy();
         for count in 2..8 {
             let candidates: Vec<_> = (0..count).map(|_| candidate(7 * 1024, now_ns)).collect();
-            assert_eq!(select_tier(&candidates, &policy, now_ns), None, "{count} parts");
+            assert_eq!(
+                select_tier(&candidates, &policy, now_ns),
+                None,
+                "{count} parts"
+            );
         }
     }
 
@@ -209,7 +215,10 @@ mod tests {
             candidate.partition = "2026-09-14".to_string();
         }
         let selected = select_tier(&candidates, &policy(), now_ns);
-        assert_eq!(selected, None, "four and four are two tiers, neither of them full");
+        assert_eq!(
+            selected, None,
+            "four and four are two tiers, neither of them full"
+        );
     }
 
     /// One pass reads what its budget allows and no more.

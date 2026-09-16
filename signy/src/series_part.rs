@@ -1811,7 +1811,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::{MetricSample, MetricValue, SampleKind, SeriesMemTable, METRIC_NAME_LABEL};
+    use crate::series::{METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesMemTable};
     use crate::tenant::test_tenant;
 
     fn labels(name: &str, instance: &str) -> SeriesLabels {
@@ -1965,11 +1965,12 @@ mod tests {
         // The quota census: both tenants have non-empty, disjoint extents.
         let part = reader.part();
         assert_eq!(part.meta.tenants.len(), 2);
-        assert!(part
-            .meta
-            .tenants
-            .iter()
-            .all(|segment| !segment.bytes.is_empty()));
+        assert!(
+            part.meta
+                .tenants
+                .iter()
+                .all(|segment| !segment.bytes.is_empty())
+        );
         assert!(part.meta.tenants[0].bytes.end <= part.meta.tenants[1].bytes.start);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2332,9 +2333,11 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         fs::write(&path, bytes).unwrap();
-        assert!(load_series_part(&parts[0].dir)
-            .unwrap_err()
-            .contains("checksum"));
+        assert!(
+            load_series_part(&parts[0].dir)
+                .unwrap_err()
+                .contains("checksum")
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

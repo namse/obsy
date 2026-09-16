@@ -529,3 +529,73 @@
         );
         assert!(tenants[0]["updated_at"].as_str().is_some());
     }
+
+    /// fn0 is the source of truth for both the policy and its revision
+    /// counter; this one endpoint fences a push against whatever revision it
+    /// carries: newer applies, an exact retry is idempotent, the same
+    /// revision with a different body conflicts, and an older delivery is a
+    /// stale no-op that reports the policy actually in force.
+    #[tokio::test]
+    async fn revision_fencing_applies_stale_duplicate_and_conflict_through_one_endpoint() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = Arc::new(TenantPolicy::for_test_with_store(storage));
+        let state = state_with(policy.clone());
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":1,"retention":"30d","log_retention":"30d","trace_retention":"30d","metric_retention":"30d","max_stored_bytes":"512MiB"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["revision"], 1);
+        assert_eq!(json["result"], "applied");
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":3,"retention":"30d","log_retention":"30d","trace_retention":"30d","metric_retention":"30d","max_stored_bytes":"512MiB"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a revision may skip ahead");
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":2,"retention":"7d","log_retention":"7d","trace_retention":"7d","metric_retention":"7d","max_stored_bytes":"1GiB"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "an older delivery is a stale no-op");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["revision"], 3, "the stale reply names the policy actually in force");
+        assert_eq!(json["result"], "stale");
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":3,"retention":"30d","log_retention":"30d","trace_retention":"30d","metric_retention":"30d","max_stored_bytes":"512MiB"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the exact retry is idempotent");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["result"],
+            "duplicate"
+        );
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":3,"retention":"7d","log_retention":"7d","trace_retention":"7d","metric_retention":"7d","max_stored_bytes":"1GiB"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "a revision cannot carry new values");
+
+        assert_eq!(policy.view(&tenant("acme")).unwrap().revision, 3);
+    }
+

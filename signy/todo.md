@@ -3175,11 +3175,9 @@ Read path:
 ## P0 — closed after the 2026-08-21 review
 
 - [x] **Per-tenant storage limit** (`max_stored_bytes`). A plan that sells a period and a size had only the
-      period: retention decided when bytes left, nothing bounded how many piled up first. Pushed per tenant
-      beside the rates, defaulted by `SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES` for tenants nothing has
-      been pushed for — which a free tier needs, since an unbounded default means the first unsold tenant
-      decides how much disk the rest get. Enforced by refusing writes, never by deleting: the space returns
-      when retention retires parts.
+      period: retention decided when bytes left, nothing bounded how many piled up first. Pushed explicitly
+      per tenant beside the rates, with no global fallback for tenants nothing has been pushed for. Enforced
+      by refusing writes, never by deleting: the space returns when retention retires parts.
 - [x] **Storage accounting no longer depends on the cache.** The usage endpoint prorated `fs::metadata` of
       the local Parquet body by row share, so an evicted part contributed nothing and the billed number fell
       as parts went cold. It reads the per-tenant extents in `meta.json` now. Trace parts gained the same

@@ -390,11 +390,20 @@ struct PolicyDocument {
 }
 
 impl PolicyStore {
-    async fn put(&self, tenant: &TenantId, document: &PolicyDocument) -> Result<(), String> {
+    async fn put(
+        &self,
+        tenant: &TenantId,
+        document: &PolicyDocument,
+        revision: u64,
+    ) -> Result<(), String> {
         let body = serde_json::to_vec(document)
             .map_err(|error| format!("failed to encode the tenant policy: {error}"))?;
         match self {
-            Self::Remote(storage) => storage.put_tenant_policy(tenant.as_str(), body).await,
+            Self::Remote(storage) => {
+                storage
+                    .put_tenant_policy_revision(tenant.as_str(), body, revision)
+                    .await
+            }
             Self::Local(root) => {
                 let root = root.clone();
                 let file_name = format!("{tenant}{POLICY_FILE_SUFFIX}");
@@ -783,7 +792,7 @@ impl TenantPolicy {
             metric_retention: signal_retentions.raw(Signal::Metrics),
             updated_at: format_timestamp(updated_at),
         };
-        if let Err(error) = store.put(tenant, &document).await {
+        if let Err(error) = store.put(tenant, &document, revision).await {
             self.metrics
                 .push_persist_errors
                 .fetch_add(1, Ordering::Relaxed);
@@ -1295,9 +1304,10 @@ mod tests {
     async fn a_legacy_policy_loads_with_revision_zero() {
         let storage = Arc::new(ObjectStorage::in_memory());
         storage
-            .put_tenant_policy(
+            .put_tenant_policy_revision(
                 "acme",
                 br#"{"retention":"30d","updated_at":"2026-09-18T00:00:00Z"}"#.to_vec(),
+                1,
             )
             .await
             .unwrap();
@@ -1365,7 +1375,7 @@ mod tests {
     async fn an_unreadable_policy_object_fails_the_load() {
         let storage = Arc::new(ObjectStorage::in_memory());
         storage
-            .put_tenant_policy("acme", b"{\"retention\":\"soon\"".to_vec())
+            .put_tenant_policy_revision("acme", b"{\"retention\":\"soon\"".to_vec(), 1)
             .await
             .unwrap();
         let config = Config::default();

@@ -24,16 +24,16 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
-use crate::compaction_tier::{select_tier, TierCandidate, TierPolicy};
+use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
 use crate::config::Config;
-use crate::object_storage::{is_inputs_changed_error, RemoteCache, TraceManifestPart};
+use crate::object_storage::{RemoteCache, TraceManifestPart, is_inputs_changed_error};
 use crate::shutdown::wait_for_drain;
 use crate::trace_part::{self, TracePartReader};
 use crate::trace_registry::TraceRegistry;
@@ -475,7 +475,7 @@ mod tests {
 
     use super::*;
     use crate::tenant::test_tenant;
-    use crate::trace::{normalize_request, TraceSpan};
+    use crate::trace::{TraceSpan, normalize_request};
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
@@ -615,15 +615,17 @@ mod tests {
             ..Config::default()
         };
 
-        assert!(compact_once(
-            &registry,
-            Arc::new(tokio::sync::RwLock::new(())),
-            &traces_root,
-            Some(&cache),
-            &config,
-        )
-        .await
-        .unwrap());
+        assert!(
+            compact_once(
+                &registry,
+                Arc::new(tokio::sync::RwLock::new(())),
+                &traces_root,
+                Some(&cache),
+                &config,
+            )
+            .await
+            .unwrap()
+        );
 
         let manifest = storage.load_trace_manifest().await.unwrap();
         assert_eq!(manifest.generation, generation_before + 1);

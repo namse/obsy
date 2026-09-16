@@ -116,23 +116,24 @@
     /// The limit is a stock, not a flow: being under it admits regardless of
     /// how fast the tenant is writing, and being at it refuses regardless of
     /// how slowly.
-    #[test]
-    fn a_tenant_at_its_storage_limit_is_refused_and_told_to_wait() {
+    #[tokio::test]
+    async fn a_tenant_at_its_storage_limit_is_refused_and_told_to_wait() {
         let parts = registry_holding(&["acme"]);
         let stored = parts.tenant_stored_bytes(&tenant("acme"));
-        let under = Config {
-            default_tenant_max_stored_bytes: Some(stored + 1),
-            ..Config::default()
-        };
-        quota_over(under, Arc::new(TenantPolicy::disabled()), parts.clone())
+        let policy = Arc::new(TenantPolicy::enabled_for_test());
+        policy
+            .push(&tenant("acme"), 1, "30d", Some(&(stored + 1).to_string()))
+            .await
+            .unwrap();
+        quota_over(Config::default(), policy.clone(), parts.clone())
             .admit_storage(&tenant("acme"))
             .expect("a tenant below its limit still writes");
 
-        let at = Config {
-            default_tenant_max_stored_bytes: Some(stored),
-            ..Config::default()
-        };
-        let error = quota_over(at, Arc::new(TenantPolicy::disabled()), parts)
+        policy
+            .push(&tenant("acme"), 2, "30d", Some(&stored.to_string()))
+            .await
+            .unwrap();
+        let error = quota_over(Config::default(), policy, parts)
             .admit_storage(&tenant("acme"))
             .expect_err("a tenant at its limit is refused");
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
@@ -147,15 +148,20 @@
     /// charged like the other two. M14 added metric parts without teaching the
     /// usage endpoint about them, which left a tenant refused on a total larger
     /// than the one it was shown; both readers ask `tenant_stored_bytes` now.
-    #[test]
-    fn a_tenant_holding_only_metrics_is_charged_for_them() {
+    #[tokio::test]
+    async fn a_tenant_holding_only_metrics_is_charged_for_them() {
         let series_parts = series_registry_holding("acme");
         let stored = series_parts.tenant_stored_bytes(&tenant("acme"));
         let empty_logs = Arc::new(crate::part_registry::PartRegistry::new());
+        let policy = Arc::new(TenantPolicy::enabled_for_test());
+        policy
+            .push(&tenant("acme"), 1, "30d", Some(&stored.to_string()))
+            .await
+            .unwrap();
 
         let quota = quota_over_all(
             Config::default(),
-            Arc::new(TenantPolicy::disabled()),
+            policy.clone(),
             empty_logs.clone(),
             series_parts.clone(),
         );
@@ -165,31 +171,23 @@
             "a tenant with no logs and no traces still stores its metric parts"
         );
 
-        let at = Config {
-            default_tenant_max_stored_bytes: Some(stored),
-            ..Config::default()
-        };
-        quota_over_all(
-            at,
-            Arc::new(TenantPolicy::disabled()),
-            empty_logs,
-            series_parts,
-        )
-        .admit_storage(&tenant("acme"))
-        .expect_err("metric bytes alone reach the limit");
+        quota_over_all(Config::default(), policy, empty_logs, series_parts)
+            .admit_storage(&tenant("acme"))
+            .expect_err("metric bytes alone reach the limit");
     }
 
     /// One tenant's storage says nothing about its neighbour's, even though
     /// they share the object.
-    #[test]
-    fn a_storage_limit_does_not_reach_the_tenant_beside_it() {
+    #[tokio::test]
+    async fn a_storage_limit_does_not_reach_the_tenant_beside_it() {
         let parts = registry_holding(&["acme"]);
         let stored = parts.tenant_stored_bytes(&tenant("acme"));
-        let config = Config {
-            default_tenant_max_stored_bytes: Some(stored),
-            ..Config::default()
-        };
-        let quota = quota_over(config, Arc::new(TenantPolicy::disabled()), parts);
+        let policy = Arc::new(TenantPolicy::enabled_for_test());
+        policy
+            .push(&tenant("acme"), 1, "30d", Some(&stored.to_string()))
+            .await
+            .unwrap();
+        let quota = quota_over(Config::default(), policy, parts);
         quota
             .admit_storage(&tenant("acme"))
             .expect_err("the tenant holding the part is at its limit");
@@ -198,10 +196,9 @@
             .expect("a tenant holding nothing is not");
     }
 
-    /// The pushed limit wins over the configured default — a free-tier default
-    /// is what a tenant gets until a plan is sold to it.
+    /// A pushed limit applies only to the tenant that named it.
     #[tokio::test]
-    async fn a_pushed_storage_limit_overrides_the_free_tier_default() {
+    async fn a_pushed_storage_limit_applies_only_to_the_named_tenant() {
         let parts = registry_holding(&["acme", "globex"]);
         let stored = parts.tenant_stored_bytes(&tenant("acme"));
         let clock = Clock::fixed(0);
@@ -210,17 +207,13 @@
             .push(&tenant("acme"), 1, "7d", Some(&format!("{}", stored * 4)))
             .await
             .unwrap();
-        let config = Config {
-            default_tenant_max_stored_bytes: Some(1),
-            ..Config::default()
-        };
-        let quota = quota_over(config, policy, parts);
+        let quota = quota_over(Config::default(), policy, parts);
         quota
             .admit_storage(&tenant("acme"))
             .expect("the pushed limit is four times what the tenant holds");
         quota
             .admit_storage(&tenant("globex"))
-            .expect_err("a tenant with nothing pushed keeps the free-tier default");
+            .expect("a tenant with no explicit limit has no policy default");
     }
 
     /// A tenant issuing many concurrent scans would otherwise hold every permit

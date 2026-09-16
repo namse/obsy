@@ -154,14 +154,6 @@ pub struct Config {
     /// of the shared query semaphore and the other tenants queue behind it
     /// however small their queries are.
     pub max_concurrent_queries_per_tenant: usize,
-    /// Bytes a tenant may keep stored, for tenants the control plane has pushed
-    /// no `max_stored_bytes` for. `None` is unbounded.
-    ///
-    /// A free tier is the reason this default exists at all: a tenant nothing
-    /// has been pushed for is one nobody has sold anything to, and leaving that
-    /// unbounded means the first such tenant decides how much disk everyone
-    /// else gets.
-    pub default_tenant_max_stored_bytes: Option<u64>,
     /// Free space on the data directory's filesystem below which ingest is
     /// refused, or `None` to accept until the writes themselves fail.
     ///
@@ -348,7 +340,6 @@ impl Default for Config {
             orphan_gc_dry_run: false,
             catalog_prune_min_age: None,
             max_concurrent_queries_per_tenant: 4,
-            default_tenant_max_stored_bytes: None,
             min_free_disk_bytes: Some(2 * 1024 * 1024 * 1024),
             log_format: LogFormat::Text,
             disk_sample_interval: Duration::from_secs(10),
@@ -732,10 +723,6 @@ impl Config {
             max_concurrent_queries_per_tenant: env_positive_usize(
                 "SIGNY_MAX_CONCURRENT_QUERIES_PER_TENANT",
                 defaults.max_concurrent_queries_per_tenant,
-            )?,
-            default_tenant_max_stored_bytes: env_optional_u64(
-                "SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES",
-                defaults.default_tenant_max_stored_bytes,
             )?,
             min_free_disk_bytes: env_optional_u64(
                 "SIGNY_MIN_FREE_DISK_BYTES",

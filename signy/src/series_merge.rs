@@ -20,16 +20,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
-use crate::compaction_tier::{select_tier, TierCandidate, TierPolicy};
+use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
 use crate::config::Config;
-use crate::object_storage::{is_inputs_changed_error, MetricManifestPart, RemoteCache};
+use crate::object_storage::{MetricManifestPart, RemoteCache, is_inputs_changed_error};
 use crate::series_part::{self, SeriesPartReader};
 use crate::series_registry::SeriesRegistry;
 use crate::shutdown::wait_for_drain;
@@ -396,8 +396,8 @@ mod tests {
 
     use super::*;
     use crate::series::{
-        MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable, SeriesSnapshot,
-        SnapshotSeries, METRIC_NAME_LABEL,
+        METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable,
+        SeriesSnapshot, SnapshotSeries,
     };
     use crate::tenant::test_tenant;
 
@@ -666,9 +666,11 @@ mod tests {
 
         assert!(manifest.parts.is_empty());
         assert!(read_records(&root).unwrap().is_empty());
-        assert!(series_part::discover_series_parts(&root)
-            .unwrap()
-            .is_empty());
+        assert!(
+            series_part::discover_series_parts(&root)
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&data_dir).ok();
     }
 

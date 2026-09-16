@@ -212,14 +212,17 @@ read-modify-write over shared state, and a partially applied or reordered bulk
 push is exactly the failure the per-tenant shape makes impossible.
 
 **A tenant that was never pushed has an unknown policy, and unknown means
-keep.** Nothing is deleted for a tenant the control plane has not mentioned.
-This is the central safety rule of the design: signy never invents a
-deletion.
+exception.** Signy does not invent a retention value or delete physical data
+for a tenant the control plane has not mentioned. When the policy registry is
+enabled, the tenant is not served: its writes are dropped and its reads are
+refused. The physical bytes remain for operator handling rather than being
+silently interpreted as an explicit infinite policy.
 
-`"infinite"` and *never pushed* produce the same retention behaviour, but they
-are tracked separately in metrics, so a control plane that silently stops
-managing a tenant is visible as a rising `tenant_policy_unknown_tenants` gauge
-rather than as invisible unbounded storage.
+An explicit `"infinite"` is an operator-selected policy and is different from
+*never pushed*. They are tracked separately in metrics, so a control plane
+that silently stops managing a tenant is visible as a rising
+`tenant_policy_unknown_tenants` gauge rather than as invisible unbounded
+storage.
 
 ### Durability
 
@@ -228,10 +231,12 @@ of the push shape: a `200` is a promise that the policy survives a restart, so
 the control plane's retry loop terminates on a real guarantee.
 
 - **One object per tenant**, at `<prefix>/tenant_policies/<tenant>.json`,
-  holding `{"retention":"30d","updated_at":"<rfc3339>"}`.
-- One object per tenant makes a push a single blind write: no read-modify-write,
-  no CAS, no contention between two tenants updated concurrently. It is the
-  storage-level reason the contract is per tenant.
+  holding the retention values, storage limit, monotonic revision, and access
+  fence metadata.
+- Project-owned writes require the next revision and use the object version for
+  CAS. An exact retry of the same revision is idempotent; the ordinary operator
+  endpoint cannot mutate a project-managed tenant. Access revoke advances the
+  fence without changing retention values or deleting telemetry.
 - With no object store configured (`SIGNY_OBJECT_STORE_URL` unset) the
   same files live under `<data_dir>/tenant_policies/`, written temp-file-then-
   rename like the rest of the local state.
@@ -448,7 +453,7 @@ M7):
 | No tenant has ever been pushed | Nothing is deleted; queries unclamped. |
 | Store write fails during a push | `503`, nothing applied, nothing changed. The control plane retries. |
 | Policy load fails at boot | Fatal; the process does not start. Same as an unreadable manifest. |
-| Tenant never pushed | Kept forever. Visible via `tenant_policy_unknown_tenants`. |
+| Tenant never pushed | Not served when the policy registry is enabled; physical data is not automatically deleted or treated as explicit infinite retention. Visible via `tenant_policy_unknown_tenants`. |
 | Control plane stops pushing | The last pushed policies stay in force forever. See [Accepted risks](#accepted-risks). |
 | Retention shortened (downgrade) | Query clamp effective on the next request; bytes reclaimed at the next merge. |
 | Tenant deleted (`retention: "0"`) | Invisible immediately. Log bytes reclaimed within a few merge ticks; spans in a shared trace part may stay indefinitely, and ingest keeps being accepted. See [What zero retention does not do](#what-zero-retention-does-not-do). |

@@ -155,11 +155,6 @@ impl TenantQuota {
     fn resolve_storage_limit(&self, tenant: &TenantId) -> TenantStorageLimit {
         self.policy
             .max_stored_bytes(tenant)
-            .or_else(|| {
-                self.config
-                    .default_tenant_max_stored_bytes
-                    .map(TenantStorageLimit::Bytes)
-            })
             .unwrap_or(TenantStorageLimit::Unlimited)
     }
 

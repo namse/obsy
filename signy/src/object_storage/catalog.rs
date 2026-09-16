@@ -817,18 +817,83 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Ok(())
     }
 
-    /// One tenant's retention policy, written blind.
-    ///
-    /// One object per tenant is what lets a push be a single unconditional
-    /// write: no read-modify-write, no CAS, and no contention between two
-    /// tenants pushed concurrently. Ordering between two pushes for the *same*
-    /// tenant is the caller's problem, and `TenantPolicy` serializes them.
-    pub async fn put_tenant_policy(&self, tenant: &str, body: Vec<u8>) -> Result<(), String> {
-        self.store
-            .put(&self.tenant_policy_path(tenant), body.into())
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("failed to store the policy for tenant {tenant}: {error}"))
+    /// Store one tenant policy at its next monotonic revision. The policy
+    /// body carries the revision for restart visibility, while the object
+    /// version supplies the cross-process CAS that a local mutex cannot.
+    pub async fn put_tenant_policy_revision(
+        &self,
+        tenant: &str,
+        body: Vec<u8>,
+        revision: u64,
+    ) -> Result<(), String> {
+        let path = self.tenant_policy_path(tenant);
+        let existing = match self.store.get(&path).await {
+            Ok(result) => {
+                let e_tag = result.meta.e_tag.clone();
+                let version = result.meta.version.clone();
+                let bytes = result.bytes().await.map_err(|error| {
+                    format!("failed to read the policy for tenant {tenant}: {error}")
+                })?;
+                Some((e_tag, version, bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => {
+                return Err(format!("failed to read the policy for tenant {tenant}: {error}"));
+            }
+        };
+        let current_revision = existing
+            .as_ref()
+            .and_then(|(_, _, bytes)| {
+                serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()?
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(0);
+        if let Some((e_tag, version, current_body)) = existing {
+            if current_revision == revision && current_body == body {
+                return Ok(());
+            }
+            if revision != current_revision + 1 {
+                return Err(format!(
+                    "tenant policy revision conflict for {tenant}: current={current_revision}, requested={revision}"
+                ));
+            }
+            self.store
+                .put_opts(
+                    &path,
+                    body.into(),
+                    PutOptions {
+                        mode: PutMode::Update(UpdateVersion { e_tag, version }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("failed to update the policy for tenant {tenant}: {error}")
+                })
+        } else {
+            if revision != 1 {
+                return Err(format!(
+                    "tenant policy revision conflict for {tenant}: current=0, requested={revision}"
+                ));
+            }
+            self.store
+                .put_opts(
+                    &path,
+                    body.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("failed to create the policy for tenant {tenant}: {error}")
+                })
+        }
     }
 
     pub async fn delete_tenant_policy(&self, tenant: &str) -> Result<(), String> {

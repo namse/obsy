@@ -257,7 +257,7 @@ curl -H 'X-Tenant-Id: someone-elses-tenant' https://your-gateway/signy/api/v1/lo
 
 The engine should see your own tenant, not that one.
 
-## 6. Tenant policy and free-tier defaults
+## 6. Tenant policy
 
 The pushed policies are the tenant registry — only tenants the control plane
 has pushed a policy for are served, and retention is what each policy names.
@@ -276,11 +276,11 @@ onboarded like any other. Writes have no such fallback: an export that names no
 tenant is dropped, because a default there would pool every misconfigured
 exporter's traffic into one tenant instead of reporting it.
 
-**Set defaults before opening a free tier.** A push may carry only `retention`
-and leave the limits out, and every omitted limit is unbounded by default — the
-first such tenant decides how much disk everyone else gets. The
-`DEFAULT_TENANT_*` values below are what an onboarded tenant gets for the
-fields its policy never named.
+Retention and storage limits are explicit per-tenant policy values. Signy has
+no global or platform retention fallback. A tenant with no policy is not
+served, and its incoming telemetry is dropped and counted rather than treated
+as successfully stored. Existing physical data for such a tenant is not
+implicitly deleted by this state.
 
 `/etc/signy/signy.env`, in full:
 
@@ -294,8 +294,6 @@ AWS_SECRET_ACCESS_KEY=...
 
 SIGNY_LISTEN_ADDR=127.0.0.1:3100
 
-# Free tier: what an onboarded tenant gets for fields its plan never named.
-SIGNY_DEFAULT_TENANT_MAX_STORED_BYTES=1073741824
 ```
 
 Then push a plan per tenant. Retention and every limit take effect immediately

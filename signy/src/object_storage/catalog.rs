@@ -941,44 +941,116 @@ single-process development store use a file:// URL, which opts out of CAS delibe
         Ok(requests)
     }
 
-    /// Deletes immutable objects that are absent from both manifests only
-    /// after a grace period. Retention removes manifest visibility first; this
-    /// pass is the crash-safe, delayed physical garbage collector.
-    pub async fn garbage_collect_orphans(
-        &self,
-        grace_period: std::time::Duration,
-    ) -> Result<usize, String> {
-        self.garbage_collect_orphans_at(grace_period, chrono::Utc::now())
-            .await
+}
+
+/// When one object was first seen outside the active set, which scan cycle saw
+/// it last, and how large it is. The first sighting is what the grace period is
+/// measured from, the cycle is how a completed cycle recognizes an entry whose
+/// object is gone, and the size is what the per-pass byte budget and the dry
+/// run report.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OrphanLedgerEntry {
+    first_seen: chrono::DateTime<chrono::Utc>,
+    last_seen_cycle: u64,
+    #[serde(default)]
+    bytes: u64,
+}
+
+/// How far the current scan cycle has walked the part prefixes, and which cycle
+/// that is.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OrphanScanCursor {
+    prefix_index: usize,
+    after: Option<String>,
+    cycle: u64,
+}
+
+impl OrphanScanCursor {
+    fn first() -> Self {
+        Self {
+            prefix_index: 0,
+            after: None,
+            cycle: 0,
+        }
     }
 
-    /// Delete objects no manifest names any more, once they have been out of
-    /// the active set for `grace_period`.
-    ///
-    /// What the grace is for, now that retirement unregisters before it writes
-    /// the manifest and a reader can no longer plan a part the manifest has
-    /// dropped:
-    ///
-    /// * a restore or merge already past its plan, holding descriptors from
-    ///   the manifest it read;
-    /// * local cache state a crash left behind, which a restart reconciles
-    ///   against the store rather than against what it last had in memory;
-    /// * a manifest consumer that is not this process at all;
-    /// * a store whose listing lags its writes, where an object can be
-    ///   absent from `active` because the manifest read was stale;
-    /// * the gap between one lifecycle step and the next -- a publish whose
-    ///   objects are up but whose manifest write has not landed is held by
-    ///   the write-time half of the same check.
-    ///
-    /// So the value is a bound on how far behind the slowest of those may be,
-    /// not a guess.
-    pub(crate) async fn garbage_collect_orphans_at(
-        &self,
-        grace_period: std::time::Duration,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<usize, String> {
-        use futures_util::StreamExt;
+    fn start_next_cycle(&mut self) {
+        self.prefix_index = 0;
+        self.after = None;
+        self.cycle += 1;
+    }
+}
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OrphanLedger {
+    version: u32,
+    scan: OrphanScanCursor,
+    orphans: BTreeMap<String, OrphanLedgerEntry>,
+}
+
+impl OrphanLedger {
+    fn empty() -> Self {
+        Self {
+            version: ORPHAN_LEDGER_VERSION,
+            scan: OrphanScanCursor::first(),
+            orphans: BTreeMap::new(),
+        }
+    }
+}
+
+/// A ledger written before the scan became resumable holds first sightings
+/// alone, and dropping it would hand every object in it a fresh grace.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredOrphanLedger {
+    Current(OrphanLedger),
+    FirstSightings(BTreeMap<String, String>),
+}
+
+pub struct OrphanCollectionOptions {
+    pub grace_period: std::time::Duration,
+    pub max_runtime: std::time::Duration,
+    pub max_scanned_objects: usize,
+    pub max_deleted_objects: usize,
+    pub max_deleted_bytes: u64,
+    /// Report what the pass would delete and delete nothing. The ledger is
+    /// still written, so a dry run ages first sightings exactly as a real pass
+    /// does and the run that follows it deletes what the dry run reported.
+    pub dry_run: bool,
+}
+
+impl OrphanCollectionOptions {
+    #[cfg(test)]
+    fn unbounded(grace_period: std::time::Duration) -> Self {
+        Self {
+            grace_period,
+            max_runtime: std::time::Duration::from_secs(3600),
+            max_scanned_objects: usize::MAX,
+            max_deleted_objects: usize::MAX,
+            max_deleted_bytes: u64::MAX,
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrphanCollection {
+    pub scanned_objects: usize,
+    pub scan_cycles_completed: usize,
+    pub candidate_objects: usize,
+    pub candidate_bytes: u64,
+    pub deleted_objects: usize,
+    pub deleted_bytes: u64,
+    pub delete_errors: usize,
+    pub ledger_entries: usize,
+}
+
+impl ObjectStorage {
+    /// Every object the three manifests name, which is what the collector must
+    /// never delete. Read before anything else in a pass: a failure here ends
+    /// the pass, so an unreadable catalog can never be mistaken for an empty
+    /// active set.
+    async fn active_object_keys(&self) -> Result<HashSet<String>, String> {
         let manifest = self.load_manifest().await?;
         let trace_manifest = self.load_trace_manifest().await?;
         let metric_manifest = self.load_metric_manifest().await?;
@@ -998,58 +1070,233 @@ single-process development store use a file:// URL, which opts out of CAS delibe
                 active.insert(self.metric_part_path(part, file).to_string());
             }
         }
+        Ok(active)
+    }
+
+    /// Deletes immutable objects that are absent from all three manifests only
+    /// after a grace period. Retention removes manifest visibility first; this
+    /// pass is the crash-safe, delayed physical garbage collector.
+    pub async fn collect_orphans(
+        &self,
+        options: &OrphanCollectionOptions,
+    ) -> Result<OrphanCollection, String> {
+        self.collect_orphans_at(options, chrono::Utc::now(), tokio::time::Instant::now())
+            .await
+    }
+
+    /// Delete objects no manifest names any more, once they have been out of
+    /// the active set for `options.grace_period`.
+    ///
+    /// What the grace is for, now that retirement unregisters before it writes
+    /// the manifest and a reader can no longer plan a part the manifest has
+    /// dropped:
+    ///
+    /// * a restore or merge already past its plan, holding descriptors from
+    ///   the manifest it read;
+    /// * local cache state a crash left behind, which a restart reconciles
+    ///   against the store rather than against what it last had in memory;
+    /// * a manifest consumer that is not this process at all;
+    /// * a store whose listing lags its writes, where an object can be
+    ///   absent from `active` because the manifest read was stale;
+    /// * the gap between one lifecycle step and the next -- a publish whose
+    ///   objects are up but whose manifest write has not landed is held by
+    ///   the ledger's first sighting.
+    ///
+    /// So the value is a bound on how far behind the slowest of those may be,
+    /// not a guess.
+    ///
+    /// **A pass is bounded and resumable.** It walks the part prefixes from
+    /// the cursor the last pass left, saves the ledger as it goes, and stops
+    /// on whichever budget runs out first. That is not an optimization: the
+    /// collector that had one deadline around the whole pass deleted
+    /// sequentially until it was cut off, and everything it had learned about
+    /// objects it saw for the first time died with the pass, so a store large
+    /// enough to spend the deadline on listing alone never collected anything
+    /// again.
+    ///
+    /// **Two sightings are needed, not one.** Deletion reads the ledger as the
+    /// pass loaded it, so an object this pass saw for the first time is never
+    /// also deleted by it, however old the object is.
+    pub(crate) async fn collect_orphans_at(
+        &self,
+        options: &OrphanCollectionOptions,
+        now: chrono::DateTime<chrono::Utc>,
+        started_at: tokio::time::Instant,
+    ) -> Result<OrphanCollection, String> {
+        use futures_util::StreamExt;
+
+        let active = self.active_object_keys().await?;
         let cutoff = now
-            - chrono::Duration::from_std(grace_period)
+            - chrono::Duration::from_std(options.grace_period)
                 .map_err(|error| format!("invalid garbage-collection grace period: {error}"))?;
-        // When each object was first seen outside the active set. An object
-        // retention retires is older than the grace by construction, so the
-        // write time alone gives it no grace at all -- that check is what
-        // keeps an upload that has not reached the manifest yet, and both have
-        // to hold before anything is deleted.
-        let mut first_orphaned = self.load_orphan_ledger().await?;
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-        for prefix in [
-            self.path("parts"),
-            self.path("trace_parts"),
-            self.path("metric_parts"),
-        ] {
-            let mut stream = self.store.list(Some(&prefix));
+        let mut ledger = self.load_orphan_ledger().await?;
+        let deletable: Vec<String> = ledger
+            .orphans
+            .iter()
+            .filter(|(key, entry)| entry.first_seen < cutoff && !active.contains(key.as_str()))
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let deadline = started_at + options.max_runtime;
+        let mut outcome = OrphanCollection::default();
+        let mut scanned_since_save = 0usize;
+        // A listing that fails mid-cycle still leaves the sightings it made
+        // worth keeping, so the pass saves them before it reports.
+        let mut scan_error = None;
+        while outcome.scanned_objects < options.max_scanned_objects
+            && tokio::time::Instant::now() < deadline
+        {
+            let Some(prefix_name) = ORPHAN_PREFIXES.get(ledger.scan.prefix_index).copied() else {
+                // The cycle closed, so an entry no listing touched during it
+                // stands for an object that is no longer in the store. Cycles
+                // are counted rather than timed: a sighting and the reset that
+                // follows it share one pass's timestamp, so a comparison of
+                // times cannot tell them apart.
+                ledger
+                    .orphans
+                    .retain(|_, entry| entry.last_seen_cycle == ledger.scan.cycle);
+                ledger.scan.start_next_cycle();
+                outcome.scan_cycles_completed += 1;
+                break;
+            };
+            let prefix = self.path(prefix_name);
+            let mut stream = match ledger.scan.after.clone() {
+                Some(after) => self
+                    .store
+                    .list_with_offset(Some(&prefix), &ObjectPath::from(after)),
+                None => self.store.list(Some(&prefix)),
+            };
+            let mut prefix_exhausted = true;
             while let Some(item) = stream.next().await {
-                let meta = item.map_err(|error| format!("failed to list object store: {error}"))?;
+                let meta = match item {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        scan_error = Some(format!("failed to list object store: {error}"));
+                        prefix_exhausted = false;
+                        break;
+                    }
+                };
                 let key = meta.location.to_string();
                 if active.contains(key.as_str()) {
                     // Back in the active set, so any grace it had started is
                     // no longer about anything.
-                    first_orphaned.remove(&key);
-                    continue;
+                    ledger.orphans.remove(&key);
+                } else {
+                    ledger
+                        .orphans
+                        .entry(key.clone())
+                        .and_modify(|entry| {
+                            entry.last_seen_cycle = ledger.scan.cycle;
+                            entry.bytes = meta.size;
+                        })
+                        .or_insert(OrphanLedgerEntry {
+                            first_seen: now,
+                            last_seen_cycle: ledger.scan.cycle,
+                            bytes: meta.size,
+                        });
                 }
-                seen.insert(key.clone());
-                let orphaned_at = *first_orphaned.entry(key).or_insert(now);
-                if meta.last_modified < cutoff && orphaned_at < cutoff {
-                    candidates.push(meta.location);
+                ledger.scan.after = Some(key);
+                outcome.scanned_objects += 1;
+                scanned_since_save += 1;
+                if scanned_since_save >= ORPHAN_LEDGER_SAVE_INTERVAL {
+                    self.store_orphan_ledger(&ledger).await?;
+                    scanned_since_save = 0;
+                }
+                if outcome.scanned_objects >= options.max_scanned_objects
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    prefix_exhausted = false;
+                    break;
+                }
+            }
+            drop(stream);
+            if prefix_exhausted {
+                ledger.scan.prefix_index += 1;
+                ledger.scan.after = None;
+            }
+            if scan_error.is_some() {
+                break;
+            }
+        }
+
+        let mut deletable_bytes = 0u64;
+        let mut within_budget = Vec::new();
+        let mut within_budget_bytes = 0u64;
+        for key in &deletable {
+            let bytes = ledger.orphans.get(key).map_or(0, |entry| entry.bytes);
+            deletable_bytes += bytes;
+            if within_budget.len() >= options.max_deleted_objects
+                || (!within_budget.is_empty()
+                    && within_budget_bytes + bytes > options.max_deleted_bytes)
+            {
+                continue;
+            }
+            within_budget_bytes += bytes;
+            within_budget.push(key.clone());
+        }
+        outcome.candidate_objects = deletable.len();
+        outcome.candidate_bytes = deletable_bytes;
+
+        if !options.dry_run {
+            for chunk in within_budget.chunks(ORPHAN_DELETE_CHUNK) {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let locations = futures_util::stream::iter(
+                    chunk
+                        .iter()
+                        .map(|key| Ok(ObjectPath::from(key.clone())))
+                        .collect::<Vec<_>>(),
+                )
+                .boxed();
+                let mut deletions = self.store.delete_stream(locations);
+                while let Some(deletion) = deletions.next().await {
+                    let deleted = match deletion {
+                        Ok(location) => location.to_string(),
+                        // Already gone is the state this pass wanted.
+                        Err(object_store::Error::NotFound { path, .. }) => path,
+                        Err(error) => {
+                            outcome.delete_errors += 1;
+                            tracing::warn!(%error, "failed to delete an orphan object");
+                            continue;
+                        }
+                    };
+                    if let Some(entry) = ledger.orphans.remove(&deleted) {
+                        outcome.deleted_bytes += entry.bytes;
+                    }
+                    outcome.deleted_objects += 1;
+                }
+                if outcome.delete_errors >= ORPHAN_DELETE_ERROR_LIMIT {
+                    break;
                 }
             }
         }
-        // An object nobody lists any more takes its entry with it.
-        first_orphaned.retain(|key, _| seen.contains(key));
-        let mut removed = 0;
-        for location in candidates {
-            match self.store.delete(&location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                    first_orphaned.remove(&location.to_string());
-                    removed += 1;
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "failed to delete orphan object {}: {error}",
-                        location
-                    ));
-                }
-            }
+
+        outcome.ledger_entries = ledger.orphans.len();
+        self.store_orphan_ledger(&ledger).await?;
+        if let Some(error) = scan_error {
+            return Err(error);
         }
-        self.store_orphan_ledger(&first_orphaned).await?;
-        Ok(removed)
+        if outcome.delete_errors >= ORPHAN_DELETE_ERROR_LIMIT {
+            return Err(format!(
+                "gave up after {} failed orphan deletions",
+                outcome.delete_errors
+            ));
+        }
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn garbage_collect_orphans_at(
+        &self,
+        grace_period: std::time::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, String> {
+        let options = OrphanCollectionOptions::unbounded(grace_period);
+        Ok(self
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await?
+            .deleted_objects)
     }
 
     /// The collector's own record of when each object left the active set.
@@ -1059,38 +1306,42 @@ single-process development store use a file:// URL, which opts out of CAS delibe
     /// reading it this way can only hold an object longer, never delete one
     /// early. It lives beside the manifests rather than under the part
     /// prefixes so that the collector never lists its own bookkeeping.
-    async fn load_orphan_ledger(
-        &self,
-    ) -> Result<BTreeMap<String, chrono::DateTime<chrono::Utc>>, String> {
+    async fn load_orphan_ledger(&self) -> Result<OrphanLedger, String> {
         let bytes = match self.store.get(&self.path(GC_ORPHANS_FILE)).await {
             Ok(result) => result
                 .bytes()
                 .await
                 .map_err(|error| format!("failed to read the orphan ledger: {error}"))?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(BTreeMap::new()),
+            Err(object_store::Error::NotFound { .. }) => return Ok(OrphanLedger::empty()),
             Err(error) => return Err(format!("failed to load the orphan ledger: {error}")),
         };
-        let raw: BTreeMap<String, String> = serde_json::from_slice(&bytes)
+        let stored: StoredOrphanLedger = serde_json::from_slice(&bytes)
             .map_err(|error| format!("invalid orphan ledger: {error}"))?;
-        Ok(raw
-            .into_iter()
-            .filter_map(|(key, at)| {
-                chrono::DateTime::parse_from_rfc3339(&at)
-                    .ok()
-                    .map(|at| (key, at.with_timezone(&chrono::Utc)))
-            })
-            .collect())
+        Ok(match stored {
+            StoredOrphanLedger::Current(ledger) => ledger,
+            StoredOrphanLedger::FirstSightings(sightings) => OrphanLedger {
+                orphans: sightings
+                    .into_iter()
+                    .filter_map(|(key, at)| {
+                        chrono::DateTime::parse_from_rfc3339(&at).ok().map(|at| {
+                            (
+                                key,
+                                OrphanLedgerEntry {
+                                    first_seen: at.with_timezone(&chrono::Utc),
+                                    last_seen_cycle: 0,
+                                    bytes: 0,
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+                ..OrphanLedger::empty()
+            },
+        })
     }
 
-    async fn store_orphan_ledger(
-        &self,
-        entries: &BTreeMap<String, chrono::DateTime<chrono::Utc>>,
-    ) -> Result<(), String> {
-        let raw: BTreeMap<&str, String> = entries
-            .iter()
-            .map(|(key, at)| (key.as_str(), at.to_rfc3339()))
-            .collect();
-        let body = serde_json::to_vec(&raw)
+    async fn store_orphan_ledger(&self, ledger: &OrphanLedger) -> Result<(), String> {
+        let body = serde_json::to_vec(ledger)
             .map_err(|error| format!("failed to encode the orphan ledger: {error}"))?;
         self.store
             .put_opts(

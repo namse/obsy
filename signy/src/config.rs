@@ -136,6 +136,14 @@ pub struct Config {
     /// retention, because merges and compactions orphan their inputs too, and
     /// a deployment younger than its retention period retires nothing.
     pub orphan_gc_interval: Duration,
+    /// What one collection pass may spend before it saves its place and
+    /// leaves the rest to the next one.
+    pub orphan_gc_max_runtime: Duration,
+    pub orphan_gc_max_scanned_objects: usize,
+    pub orphan_gc_max_deleted_objects: usize,
+    pub orphan_gc_max_deleted_bytes: u64,
+    /// Report what collection would delete without deleting it.
+    pub orphan_gc_dry_run: bool,
     /// Age past which catalog commits and snapshots that no startup reads any
     /// more are deleted, or `None` to keep all of them. It has to exceed the
     /// Bucket Lock rule on `catalog/`, which refuses younger deletes.
@@ -333,6 +341,11 @@ impl Default for Config {
             retention_grace_period: Duration::from_secs(60 * 60),
             max_retention_runtime: Duration::from_secs(120),
             orphan_gc_interval: Duration::from_secs(60 * 60),
+            orphan_gc_max_runtime: Duration::from_secs(120),
+            orphan_gc_max_scanned_objects: 200_000,
+            orphan_gc_max_deleted_objects: 20_000,
+            orphan_gc_max_deleted_bytes: 4 * 1024 * 1024 * 1024,
+            orphan_gc_dry_run: false,
             catalog_prune_min_age: None,
             max_concurrent_queries_per_tenant: 4,
             default_tenant_max_stored_bytes: None,
@@ -550,6 +563,20 @@ fn derive_defaults_from_budget(defaults: &mut Config, budget_bytes: u64) {
 }
 
 impl Config {
+    /// What one orphan-collection pass may spend, and whether it deletes at
+    /// all. Every bound is per pass and the scan resumes where the last one
+    /// stopped, so a bound costs time to completion rather than coverage.
+    pub fn orphan_collection_options(&self) -> crate::object_storage::OrphanCollectionOptions {
+        crate::object_storage::OrphanCollectionOptions {
+            grace_period: self.retention_grace_period,
+            max_runtime: self.orphan_gc_max_runtime,
+            max_scanned_objects: self.orphan_gc_max_scanned_objects,
+            max_deleted_objects: self.orphan_gc_max_deleted_objects,
+            max_deleted_bytes: self.orphan_gc_max_deleted_bytes,
+            dry_run: self.orphan_gc_dry_run,
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let mut defaults = Self::default();
         let host = HostMemory::detect();
@@ -681,6 +708,23 @@ impl Config {
                 "SIGNY_ORPHAN_GC_INTERVAL",
                 defaults.orphan_gc_interval,
             )?,
+            orphan_gc_max_runtime: env_required_duration(
+                "SIGNY_ORPHAN_GC_MAX_RUNTIME",
+                defaults.orphan_gc_max_runtime,
+            )?,
+            orphan_gc_max_scanned_objects: env_positive_usize(
+                "SIGNY_ORPHAN_GC_MAX_SCANNED_OBJECTS",
+                defaults.orphan_gc_max_scanned_objects,
+            )?,
+            orphan_gc_max_deleted_objects: env_positive_usize(
+                "SIGNY_ORPHAN_GC_MAX_DELETED_OBJECTS",
+                defaults.orphan_gc_max_deleted_objects,
+            )?,
+            orphan_gc_max_deleted_bytes: env_positive_u64(
+                "SIGNY_ORPHAN_GC_MAX_DELETED_BYTES",
+                defaults.orphan_gc_max_deleted_bytes,
+            )?,
+            orphan_gc_dry_run: env_bool("SIGNY_ORPHAN_GC_DRY_RUN", defaults.orphan_gc_dry_run)?,
             catalog_prune_min_age: env_duration(
                 "SIGNY_CATALOG_PRUNE_MIN_AGE",
                 defaults.catalog_prune_min_age,
@@ -940,6 +984,8 @@ selected above the read budget can never be merged",
         positive_usize("retention_batch_size", self.retention_batch_size)?;
         positive_duration("retention_grace_period", self.retention_grace_period)?;
         positive_duration("max_retention_runtime", self.max_retention_runtime)?;
+        positive_duration("orphan_gc_interval", self.orphan_gc_interval)?;
+        positive_duration("orphan_gc_max_runtime", self.orphan_gc_max_runtime)?;
         if !self.retention_rewrite_threshold.is_finite()
             || self.retention_rewrite_threshold <= 0.0
             || self.retention_rewrite_threshold > 1.0

@@ -84,7 +84,23 @@ pub struct RuntimeMetrics {
     pub retention_rewrite_skipped: AtomicU64,
     pub object_store_gc_success: AtomicU64,
     pub object_store_gc_errors: AtomicU64,
+    pub orphan_collect_success: AtomicU64,
+    pub orphan_collect_errors: AtomicU64,
     pub orphan_objects_removed: AtomicU64,
+    pub orphan_bytes_removed: AtomicU64,
+    /// Deletions the store refused. The objects keep their ledger entries, so
+    /// a later pass retries them.
+    pub orphan_delete_errors: AtomicU64,
+    /// Completed walks of every part prefix. Until the first one finishes, an
+    /// entry for an object that no longer exists is still in the ledger.
+    pub orphan_scan_cycles: AtomicU64,
+    /// What the last pass found deletable, whether or not its budget let it
+    /// delete that much. This is the dry run's answer.
+    pub orphan_candidate_objects: AtomicU64,
+    pub orphan_candidate_bytes: AtomicU64,
+    pub orphan_ledger_entries: AtomicU64,
+    pub catalog_prune_success: AtomicU64,
+    pub catalog_prune_errors: AtomicU64,
     pub catalog_objects_pruned: AtomicU64,
     pub query_success: AtomicU64,
     pub query_errors: AtomicU64,
@@ -190,7 +206,17 @@ impl RuntimeMetrics {
             retention_rewrite_skipped: AtomicU64::new(0),
             object_store_gc_success: AtomicU64::new(0),
             object_store_gc_errors: AtomicU64::new(0),
+            orphan_collect_success: AtomicU64::new(0),
+            orphan_collect_errors: AtomicU64::new(0),
             orphan_objects_removed: AtomicU64::new(0),
+            orphan_bytes_removed: AtomicU64::new(0),
+            orphan_delete_errors: AtomicU64::new(0),
+            orphan_scan_cycles: AtomicU64::new(0),
+            orphan_candidate_objects: AtomicU64::new(0),
+            orphan_candidate_bytes: AtomicU64::new(0),
+            orphan_ledger_entries: AtomicU64::new(0),
+            catalog_prune_success: AtomicU64::new(0),
+            catalog_prune_errors: AtomicU64::new(0),
             catalog_objects_pruned: AtomicU64::new(0),
             query_success: AtomicU64::new(0),
             query_errors: AtomicU64::new(0),

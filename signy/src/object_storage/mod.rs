@@ -133,6 +133,20 @@ const FLUSH_TRANSACTION_FILE: &str = "flush.txn";
 /// active set. Nothing but the collector reads it, so retirement time never
 /// becomes a concept every manifest reader has to carry.
 const GC_ORPHANS_FILE: &str = "gc-orphans.json";
+/// The prefixes one orphan-collection cycle walks, in order.
+const ORPHAN_PREFIXES: [&str; 3] = ["parts", "trace_parts", "metric_parts"];
+const ORPHAN_LEDGER_VERSION: u32 = 2;
+/// Objects a scan may list before it saves what it has learned. A pass that
+/// saved only at the end lost every first sighting it had made when its budget
+/// ran out mid-scan, which is what kept a large store's orphans from ever
+/// reaching their second sighting.
+const ORPHAN_LEDGER_SAVE_INTERVAL: usize = 20_000;
+/// Objects per delete request, which is the S3 bulk-delete maximum.
+const ORPHAN_DELETE_CHUNK: usize = 1_000;
+/// Failed deletions one pass tolerates before it stops and reports. Deletion
+/// is idempotent and the ledger keeps what was not deleted, so stopping costs
+/// the rest of this pass and nothing else.
+const ORPHAN_DELETE_ERROR_LIMIT: usize = 100;
 
 /// Prefix of the error `publish` returns when another writer already replaced
 /// the inputs of a replacement. The store is healthy and nothing was written:

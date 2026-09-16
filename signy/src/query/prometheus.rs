@@ -392,9 +392,44 @@ fn object_store_gc_metrics(state: &AppState) -> String {
             metrics.object_store_gc_errors.load(Ordering::Relaxed),
         ),
         (
+            "signy_orphan_collect_success_total",
+            "Orphan collection passes that finished, whether or not their budget let them delete everything deletable.",
+            metrics.orphan_collect_success.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_collect_errors_total",
+            "Orphan collection passes that failed. The next pass resumes from the stored ledger and scan cursor.",
+            metrics.orphan_collect_errors.load(Ordering::Relaxed),
+        ),
+        (
             "signy_orphan_objects_removed_total",
             "Part objects deleted because no manifest named them for longer than SIGNY_RETENTION_GRACE_PERIOD.",
             metrics.orphan_objects_removed.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_bytes_removed_total",
+            "Bytes reclaimed by orphan collection.",
+            metrics.orphan_bytes_removed.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_delete_errors_total",
+            "Orphan deletions the object store refused. Their ledger entries survive, so a later pass retries them.",
+            metrics.orphan_delete_errors.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_scan_cycles_total",
+            "Completed walks of every part prefix.",
+            metrics.orphan_scan_cycles.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_catalog_prune_success_total",
+            "Catalog pruning passes that finished. Independent of orphan collection.",
+            metrics.catalog_prune_success.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_catalog_prune_errors_total",
+            "Catalog pruning passes that failed or timed out.",
+            metrics.catalog_prune_errors.load(Ordering::Relaxed),
         ),
         (
             "signy_catalog_objects_pruned_total",
@@ -404,6 +439,27 @@ fn object_store_gc_metrics(state: &AppState) -> String {
     ] {
         out.push_str(&format!(
             "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "signy_orphan_candidate_objects",
+            "Objects the last pass found deletable, whether or not its budget let it delete them. With SIGNY_ORPHAN_GC_DRY_RUN this is what a real pass would delete.",
+            metrics.orphan_candidate_objects.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_candidate_bytes",
+            "Bytes the last pass found deletable.",
+            metrics.orphan_candidate_bytes.load(Ordering::Relaxed),
+        ),
+        (
+            "signy_orphan_ledger_entries",
+            "Objects the collector is tracking outside the active set.",
+            metrics.orphan_ledger_entries.load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
         ));
     }
     out

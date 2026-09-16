@@ -2287,3 +2287,619 @@ opens a connection per part"
         assert_eq!(restored[0].request_id, request.request_id);
         assert!(!restarted.mask_for(&tenant).is_empty());
     }
+
+    /// An object store whose listing can be slowed, whose reads can be made to
+    /// fail for one path, and whose deletes can be refused -- the three things
+    /// the collector's budgets, its fail-closed rule and an R2 Bucket Lock
+    /// look like from inside a test.
+    #[derive(Debug)]
+    struct ScriptedStore {
+        inner: Arc<dyn ObjectStore>,
+        list_delay: std::time::Duration,
+        unreadable: Option<String>,
+        unlistable: Option<String>,
+        undeletable: Option<String>,
+        deletes_attempted: AtomicU64,
+    }
+
+    impl ScriptedStore {
+        fn wrapping(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                list_delay: std::time::Duration::ZERO,
+                unreadable: None,
+                unlistable: None,
+                undeletable: None,
+                deletes_attempted: AtomicU64::new(0),
+            }
+        }
+
+        fn with_list_delay(mut self, delay: std::time::Duration) -> Self {
+            self.list_delay = delay;
+            self
+        }
+
+        fn refusing_reads_of(mut self, path_fragment: &str) -> Self {
+            self.unreadable = Some(path_fragment.to_string());
+            self
+        }
+
+        fn refusing_listing_of(mut self, path_fragment: &str) -> Self {
+            self.unlistable = Some(path_fragment.to_string());
+            self
+        }
+
+        fn refusing_deletes_of(mut self, path_fragment: &str) -> Self {
+            self.undeletable = Some(path_fragment.to_string());
+            self
+        }
+    }
+
+    impl std::fmt::Display for ScriptedStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "ScriptedStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ScriptedStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(fragment) = &self.unreadable
+                && location.as_ref().contains(fragment.as_str())
+            {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "read refused".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.deletes_attempted.fetch_add(1, Ordering::Relaxed);
+            if let Some(fragment) = &self.undeletable
+                && location.as_ref().contains(fragment.as_str())
+            {
+                return Err(object_store::Error::Generic {
+                    store: "scripted",
+                    source: "delete refused".into(),
+                });
+            }
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            use futures_util::StreamExt;
+            if let Some(fragment) = &self.unlistable
+                && prefix.is_some_and(|prefix| prefix.as_ref().contains(fragment.as_str()))
+            {
+                return futures_util::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "scripted",
+                        source: "listing refused".into(),
+                    })
+                })
+                .boxed();
+            }
+            let delay = self.list_delay;
+            self.inner
+                .list(prefix)
+                .then(move |item| async move {
+                    tokio::time::sleep(delay).await;
+                    item
+                })
+                .boxed()
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            use futures_util::StreamExt;
+            if let Some(fragment) = &self.unlistable
+                && prefix.is_some_and(|prefix| prefix.as_ref().contains(fragment.as_str()))
+            {
+                return futures_util::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "scripted",
+                        source: "listing refused".into(),
+                    })
+                })
+                .boxed();
+            }
+            let delay = self.list_delay;
+            self.inner
+                .list_with_offset(prefix, offset)
+                .then(move |item| async move {
+                    tokio::time::sleep(delay).await;
+                    item
+                })
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// Publishes `count` parts and retires all but the first, so the store
+    /// holds one active part and `count - 1` orphaned ones.
+    async fn store_with_orphans(
+        storage: &ObjectStorage,
+        label: &str,
+        count: usize,
+    ) -> (Vec<ManifestPart>, Vec<ManifestPart>) {
+        let root = temp_dir(label).join("parts");
+        let mut published = Vec::new();
+        for index in 0..count {
+            let parts =
+                part::flush_rows(vec![row(&format!("{label}-{index}"))], &root, 100 + index)
+                    .unwrap();
+            storage.publish(&parts, &[]).await.unwrap();
+            published.push(ManifestPart::from(&parts[0]));
+        }
+        let (active, retired) = published.split_at(1);
+        let retired_ids: Vec<String> = retired.iter().map(|part| part.id.clone()).collect();
+        storage.publish(&[], &retired_ids).await.unwrap();
+        (active.to_vec(), retired.to_vec())
+    }
+
+    fn bounded_options(
+        grace_period: std::time::Duration,
+        max_scanned_objects: usize,
+        max_deleted_objects: usize,
+    ) -> OrphanCollectionOptions {
+        OrphanCollectionOptions {
+            grace_period,
+            max_runtime: std::time::Duration::from_secs(60),
+            max_scanned_objects,
+            max_deleted_objects,
+            max_deleted_bytes: u64::MAX,
+            dry_run: false,
+        }
+    }
+
+    /// The rule that makes the collector safe to point at a large store: an
+    /// object it sees for the first time in this pass is never also deleted by
+    /// it, however long ago the object was retired. Two passes have to agree.
+    #[tokio::test]
+    async fn an_object_seen_for_the_first_time_is_never_deleted_by_the_pass_that_saw_it() {
+        let storage = ObjectStorage::in_memory();
+        let (_, retired) = store_with_orphans(&storage, "gc-two-sightings", 2).await;
+        let key = storage.part_path(&retired[0], DATA_FILE);
+        // No grace at all, so only the two-sightings rule can hold it.
+        let options = bounded_options(std::time::Duration::ZERO, usize::MAX, usize::MAX);
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let first = storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(first.deleted_objects, 0, "the first sighting deletes nothing");
+        assert!(storage.store.head(&key).await.is_ok());
+
+        let second = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(1),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(second.deleted_objects > 0, "the second pass deletes what the first recorded");
+        assert!(storage.store.head(&key).await.is_err());
+    }
+
+    /// A pass whose scan budget runs out has to leave the sightings it made
+    /// behind it. The collector this replaced dropped them, so a store it
+    /// could not finish scanning never reached a second sighting at all.
+    #[tokio::test]
+    async fn a_scan_that_runs_out_of_budget_keeps_what_it_learned_and_resumes() {
+        let storage = ObjectStorage::in_memory();
+        let (active, retired) = store_with_orphans(&storage, "gc-resume", 4).await;
+        let grace = std::time::Duration::from_secs(300);
+        let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        // Two objects a pass, against nine of them (three per part).
+        let options = bounded_options(grace, 2, usize::MAX);
+
+        let mut passes = 0;
+        loop {
+            let outcome = storage
+                .collect_orphans_at(&options, retired_at, tokio::time::Instant::now())
+                .await
+                .unwrap();
+            passes += 1;
+            assert_eq!(outcome.deleted_objects, 0, "nothing is deletable inside the grace");
+            if outcome.scan_cycles_completed > 0 {
+                break;
+            }
+            assert!(passes < 20, "the scan is not making progress");
+        }
+        assert!(passes > 1, "the budget has to have cut at least one pass short");
+
+        let removed = storage
+            .collect_orphans_at(
+                &options,
+                retired_at + chrono::Duration::seconds(301),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            removed.deleted_objects > 0,
+            "sightings made by the cut-short passes are what let this one delete"
+        );
+        for part in &active {
+            assert!(
+                storage.store.head(&storage.part_path(part, DATA_FILE)).await.is_ok(),
+                "an object the manifest still names is never a candidate"
+            );
+        }
+        let mut remaining = 0;
+        for part in &retired {
+            if storage.store.head(&storage.part_path(part, DATA_FILE)).await.is_ok() {
+                remaining += 1;
+            }
+        }
+        assert!(remaining < retired.len(), "retired objects are being collected");
+    }
+
+    /// Time is the other budget, and it has to end the pass the same way: save
+    /// the ledger, report, and let the next pass carry on.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_listing_stops_at_the_deadline_and_the_next_pass_continues() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(ScriptedStore::wrapping(inner).with_list_delay(std::time::Duration::from_millis(100)));
+        let storage = ObjectStorage::from_store(store, "signy-test");
+        let (_, retired) = store_with_orphans(&storage, "gc-slow-list", 4).await;
+        let grace = std::time::Duration::from_secs(300);
+        let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        let options = OrphanCollectionOptions {
+            grace_period: grace,
+            // Two listed objects' worth of delay.
+            max_runtime: std::time::Duration::from_millis(250),
+            max_scanned_objects: usize::MAX,
+            max_deleted_objects: usize::MAX,
+            max_deleted_bytes: u64::MAX,
+            dry_run: false,
+        };
+
+        let first = storage
+            .collect_orphans_at(&options, retired_at, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        assert!(first.scanned_objects > 0, "the pass makes progress before its deadline");
+        assert!(
+            first.scanned_objects < retired.len() * PART_FILES.len(),
+            "and the deadline cuts it short"
+        );
+        assert_eq!(first.scan_cycles_completed, 0);
+
+        let second = storage
+            .collect_orphans_at(&options, retired_at, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            second.scanned_objects > 0,
+            "the next pass resumes from the stored cursor rather than starting over"
+        );
+    }
+
+    /// An unreadable catalog must stop the pass, not read as an empty active
+    /// set: that difference is every live object in the store.
+    #[tokio::test]
+    async fn collection_deletes_nothing_when_the_catalog_cannot_be_read() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(ScriptedStore::wrapping(inner.clone()));
+        let storage = ObjectStorage::from_store(store, "signy-test");
+        let (active, retired) = store_with_orphans(&storage, "gc-fail-closed", 2).await;
+        let options = bounded_options(std::time::Duration::ZERO, usize::MAX, usize::MAX);
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+        storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+
+        let blinded = ObjectStorage::from_store(
+            Arc::new(ScriptedStore::wrapping(inner).refusing_reads_of(MANIFEST_FILE)),
+            "signy-test",
+        );
+        assert!(
+            blinded
+                .collect_orphans_at(&options, now, tokio::time::Instant::now())
+                .await
+                .is_err(),
+            "a catalog read failure ends the pass"
+        );
+        for part in active.iter().chain(retired.iter()) {
+            assert!(
+                storage.store.head(&storage.part_path(part, DATA_FILE)).await.is_ok(),
+                "and it deletes nothing on the way out"
+            );
+        }
+    }
+
+    /// What a Bucket Lock, or any store that refuses a delete, looks like: the
+    /// object stays, the pass reports the refusal, and its ledger entry
+    /// survives so the next pass tries again.
+    #[tokio::test]
+    async fn a_refused_deletion_is_reported_and_retried() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(ScriptedStore::wrapping(inner).refusing_deletes_of(DATA_FILE));
+        let storage = ObjectStorage::from_store(store, "signy-test");
+        let (_, retired) = store_with_orphans(&storage, "gc-refused", 2).await;
+        let key = storage.part_path(&retired[0], DATA_FILE);
+        let options = bounded_options(std::time::Duration::ZERO, usize::MAX, usize::MAX);
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        let second = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(1),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(second.delete_errors > 0, "the refusal is reported");
+        assert!(second.deleted_objects > 0, "the objects it did not refuse are still collected");
+        assert!(storage.store.head(&key).await.is_ok());
+
+        let third = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(2),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(third.delete_errors > 0, "the refused object is tried again");
+    }
+
+    /// The dry run is what an operator reads before letting the collector
+    /// delete tens of thousands of objects, so it has to report the same
+    /// number a real pass would delete, and delete none of it.
+    #[tokio::test]
+    async fn a_dry_run_reports_its_candidates_and_deletes_nothing() {
+        let storage = ObjectStorage::in_memory();
+        let (_, retired) = store_with_orphans(&storage, "gc-dry-run", 3).await;
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+        let mut options = bounded_options(std::time::Duration::ZERO, usize::MAX, usize::MAX);
+        options.dry_run = true;
+        storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+
+        let reported = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(1),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reported.candidate_objects, retired.len() * PART_FILES.len());
+        assert!(reported.candidate_bytes > 0);
+        assert_eq!(reported.deleted_objects, 0);
+        for part in &retired {
+            assert!(storage.store.head(&storage.part_path(part, DATA_FILE)).await.is_ok());
+        }
+
+        options.dry_run = false;
+        let deleted = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(2),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.deleted_objects, reported.candidate_objects,
+            "the real pass deletes exactly what the dry run reported"
+        );
+    }
+
+    /// The delete budget bounds one pass without hiding how much is waiting.
+    #[tokio::test]
+    async fn the_delete_budget_bounds_a_pass_and_still_reports_the_rest() {
+        let storage = ObjectStorage::in_memory();
+        let (_, retired) = store_with_orphans(&storage, "gc-delete-budget", 3).await;
+        let total = retired.len() * PART_FILES.len();
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+        let options = bounded_options(std::time::Duration::ZERO, usize::MAX, 2);
+        storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+
+        let outcome = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(1),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_objects, 2, "the budget is what one pass deletes");
+        assert_eq!(outcome.candidate_objects, total, "and the rest is still reported");
+
+        let byte_bounded = OrphanCollectionOptions {
+            max_deleted_objects: usize::MAX,
+            max_deleted_bytes: 1,
+            ..bounded_options(std::time::Duration::ZERO, usize::MAX, usize::MAX)
+        };
+        let outcome = storage
+            .collect_orphans_at(
+                &byte_bounded,
+                now + chrono::Duration::seconds(2),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_objects, 1,
+            "a byte budget smaller than one object still makes progress"
+        );
+    }
+
+    /// An entry whose object something else removed has to leave the ledger,
+    /// or the ledger grows without bound over the store's lifetime.
+    #[tokio::test]
+    async fn a_completed_cycle_forgets_entries_whose_objects_are_gone() {
+        let storage = ObjectStorage::in_memory();
+        let (_, retired) = store_with_orphans(&storage, "gc-ledger-prune", 2).await;
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+        // A grace nothing reaches, so the ledger can only shrink by forgetting.
+        let options = bounded_options(std::time::Duration::from_secs(86_400), usize::MAX, usize::MAX);
+        let first = storage
+            .collect_orphans_at(&options, now, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(first.ledger_entries, retired.len() * PART_FILES.len());
+
+        for part in &retired {
+            for file in PART_FILES {
+                storage.store.delete(&storage.part_path(part, file)).await.unwrap();
+            }
+        }
+        let second = storage
+            .collect_orphans_at(
+                &options,
+                now + chrono::Duration::seconds(1),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.scan_cycles_completed, 1);
+        assert_eq!(second.ledger_entries, 0, "a closed cycle drops what it did not see");
+    }
+
+    /// A ledger written before the scan became resumable still has to be read,
+    /// or every object in it is handed a fresh grace by the upgrade.
+    #[tokio::test]
+    async fn a_first_sightings_ledger_from_an_older_version_still_ages() {
+        let storage = ObjectStorage::in_memory();
+        let (_, retired) = store_with_orphans(&storage, "gc-ledger-upgrade", 2).await;
+        let retired_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        let sightings: BTreeMap<String, String> = retired
+            .iter()
+            .flat_map(|part| {
+                PART_FILES
+                    .iter()
+                    .map(|file| (storage.part_path(part, file).to_string(), retired_at.to_rfc3339()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        storage
+            .store
+            .put(
+                &storage.path(GC_ORPHANS_FILE),
+                Bytes::from(serde_json::to_vec(&sightings).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let options = bounded_options(std::time::Duration::from_secs(300), usize::MAX, usize::MAX);
+        let outcome = storage
+            .collect_orphans_at(
+                &options,
+                retired_at + chrono::Duration::seconds(301),
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_objects,
+            retired.len() * PART_FILES.len(),
+            "the sightings the older ledger recorded are what makes them deletable"
+        );
+    }
+
+    /// Catalog history is pruned on its own terms. It used to be sequenced
+    /// behind orphan collection inside one function, so a store whose part
+    /// listing failed also kept every catalog commit it had ever written.
+    #[tokio::test]
+    async fn catalog_pruning_runs_even_when_orphan_collection_fails() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let storage = ObjectStorage::from_store(Arc::new(ScriptedStore::wrapping(inner.clone())), "signy-test");
+        commit_alternating_trace_generations(&storage, CATALOG_SNAPSHOT_INTERVAL * 3 + 5).await;
+        let commits_before = count_objects(&storage, "catalog/commits").await;
+
+        let blinded = Arc::new(ObjectStorage::from_store(
+            Arc::new(ScriptedStore::wrapping(inner).refusing_listing_of("parts")),
+            "signy-test",
+        ));
+        let cache = RemoteCache::new(blinded.clone(), temp_dir("gc-independent").join("parts"));
+        let config = crate::config::Config {
+            catalog_prune_min_age: Some(std::time::Duration::from_secs(0)),
+            ..Default::default()
+        };
+        let metrics = crate::metrics::RuntimeMetrics::new();
+
+        let (orphans, catalog) =
+            crate::object_store_gc::object_store_gc_pass(&cache, &config, &metrics).await;
+
+        assert!(orphans.is_err(), "the part listing this store refuses is what fails collection");
+        assert!(catalog.is_ok(), "and pruning runs anyway");
+        assert!(
+            count_objects(&blinded, "catalog/commits").await < commits_before,
+            "superseded commits are gone"
+        );
+    }
+
+    async fn count_objects(storage: &ObjectStorage, relative_prefix: &str) -> usize {
+        use futures_util::StreamExt;
+        storage
+            .store
+            .list(Some(&storage.path(relative_prefix)))
+            .filter(|item| futures_util::future::ready(item.is_ok()))
+            .count()
+            .await
+    }

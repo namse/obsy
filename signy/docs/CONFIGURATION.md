@@ -268,8 +268,13 @@ and there is no global period.
 | `SIGNY_RETENTION_INTERVAL` | `5m` | |
 | `SIGNY_RETENTION_BATCH_SIZE` | 100 | Number of parts processed per tick |
 | `SIGNY_RETENTION_GRACE_PERIOD` | `1h` | Grace period before deleting orphan objects |
-| `SIGNY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention/GC |
+| `SIGNY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention and catalog pruning |
 | `SIGNY_ORPHAN_GC_INTERVAL` | `1h` | How often part objects that no manifest names are collected, whether or not retention retired anything. Merges and compactions leave their inputs behind as orphans too |
+| `SIGNY_ORPHAN_GC_MAX_RUNTIME` | `2m` | What one collection pass may spend. The pass saves its scan cursor and its sightings, and the next one carries on from there, so this bounds a pass rather than the collection |
+| `SIGNY_ORPHAN_GC_MAX_SCANNED_OBJECTS` | 200000 | Objects one pass lists before it stops and saves its place |
+| `SIGNY_ORPHAN_GC_MAX_DELETED_OBJECTS` | 20000 | Objects one pass deletes. `signy_orphan_candidate_objects` reports what is still waiting |
+| `SIGNY_ORPHAN_GC_MAX_DELETED_BYTES` | `4GiB` | Bytes one pass deletes |
+| `SIGNY_ORPHAN_GC_DRY_RUN` | `false` | Report what collection would delete, in `signy_orphan_candidate_objects` and `signy_orphan_candidate_bytes`, and delete nothing. First sightings are still recorded, so a real pass afterwards deletes what the dry run reported |
 | `SIGNY_CATALOG_PRUNE_MIN_AGE` | `off` | Delete catalog commits and snapshots older than this that no startup reads any more. Two snapshots that verify on both replicas, and every commit from the older of them on, are always kept. **Set it above the Bucket Lock age on `catalog/`**, which refuses younger deletes; with a seven-day lock, `8d` |
 | `SIGNY_RETENTION_REWRITE_THRESHOLD` | 0.5 | Rewrite when the expired-row fraction of a part exceeds this value. Tenant deletion (`retention: "0"`) ignores this value |
 

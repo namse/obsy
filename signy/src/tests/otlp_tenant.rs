@@ -127,3 +127,49 @@ fn a_drop_alone_ends_the_passthrough() {
     assert_eq!(split.dropped.no_tenant, 1);
     assert!(!split.is_intact());
 }
+
+#[test]
+fn tenant_not_served_drops_are_aggregated_by_signal_without_tenant_labels() {
+    let metrics = crate::metrics::RuntimeMetrics::new();
+    Dropped {
+        tenant_not_served: 2,
+        ..Default::default()
+    }
+    .record(&metrics, "logs");
+    Dropped {
+        tenant_not_served: 3,
+        ..Default::default()
+    }
+    .record(&metrics, "traces");
+    Dropped {
+        tenant_not_served: 5,
+        ..Default::default()
+    }
+    .record(&metrics, "metrics");
+
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(
+        metrics
+            .ingest_dropped_tenant_not_served
+            .load(Relaxed),
+        10
+    );
+    assert_eq!(
+        metrics
+            .ingest_dropped_tenant_not_served_logs
+            .load(Relaxed),
+        2
+    );
+    assert_eq!(
+        metrics
+            .ingest_dropped_tenant_not_served_traces
+            .load(Relaxed),
+        3
+    );
+    assert_eq!(
+        metrics
+            .ingest_dropped_tenant_not_served_metrics
+            .load(Relaxed),
+        5
+    );
+}

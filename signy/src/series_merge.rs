@@ -46,6 +46,15 @@ const TIER_POLICY: TierPolicy = TierPolicy {
 };
 const COMPACT_DIR: &str = ".compact";
 
+fn crash_if_requested(point: &str) {
+    #[cfg(test)]
+    if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT").ok().as_deref() == Some(point) {
+        std::process::abort();
+    }
+    #[cfg(not(test))]
+    let _ = point;
+}
+
 /// Durable intent: the replacement is in `new`, the inputs it supersedes in
 /// `inputs`, both as `partition/id` relative to the metrics root.
 #[derive(Serialize, Deserialize)]
@@ -118,9 +127,14 @@ fn write_record(metrics_root: &Path, id: &str, record: &CompactRecord) -> Result
             .write(true)
             .open(&temporary)?;
         file.write_all(&bytes)?;
+        crash_if_requested("before_temp_fsync");
         file.sync_all()?;
+        crash_if_requested("after_temp_fsync");
         std::fs::rename(&temporary, &path)?;
+        crash_if_requested("after_rename");
+        crash_if_requested("before_directory_fsync");
         std::fs::File::open(&dir)?.sync_all()?;
+        crash_if_requested("after_directory_fsync");
         Ok(())
     })();
     if let Err(error) = result {
@@ -186,7 +200,9 @@ pub(crate) fn record_dir(metrics_root: &Path, relative: &str) -> Result<PathBuf,
 /// whose replacement never became durable loses (the inputs stay and only the
 /// record goes).
 pub fn recover_local_compactions(metrics_root: &Path) -> Result<(), String> {
+    remove_temporary_records(metrics_root)?;
     for (path, record) in read_records(metrics_root)? {
+        crash_if_requested("recovery_record_processing");
         let replacement_durable = record.new.iter().all(|relative| {
             record_dir(metrics_root, relative)
                 .map(|dir| series_part::load_series_part(&dir).is_ok())
@@ -208,6 +224,22 @@ pub fn recover_local_compactions(metrics_root: &Path) -> Result<(), String> {
             crate::part::remove_part_dirs(&dirs)?;
         }
         remove_record(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_temporary_records(metrics_root: &Path) -> Result<(), String> {
+    let dir = compact_dir(metrics_root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("tmp") {
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -254,6 +286,7 @@ pub async fn compact_once(
     // restart can therefore safely discard a partial output and retain all
     // inputs, including a crash between record creation and the first write.
     let record_path = write_record(metrics_root, &output_id, &record)?;
+    crash_if_requested("after_durable_intent");
     let new_parts =
         match series_part::compact_series_parts_with_id(&inputs, metrics_root, &output_id) {
             Ok(parts) => parts,
@@ -716,5 +749,83 @@ mod tests {
         assert!(!replacement.exists(), "the partial output is rolled back");
         assert!(read_records(&root).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn process_crashes_at_each_metric_compaction_boundary_recover_without_loss() {
+        let points = [
+            "before_temp_fsync",
+            "after_temp_fsync",
+            "after_rename",
+            "before_directory_fsync",
+            "after_directory_fsync",
+            "after_durable_intent",
+            "recovery_record_processing",
+        ];
+        for point in points {
+            let root = temp_root("process-fault");
+            let series = labels("queue_depth", "a");
+            for index in 0..COMPACT_MIN_PARTS {
+                flush_one_part(
+                    &root,
+                    &series,
+                    1_772_000_000_000_000_000 + index as i64 * 60_000_000_000,
+                    5,
+                );
+            }
+            let registry = registry_over(&root);
+            let before = all_samples(&registry);
+            if point == "recovery_record_processing" {
+                let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
+                let partition = inputs[0].part().meta.partition.clone();
+                let record = CompactRecord {
+                    new: vec![format!("{partition}/recovery-output")],
+                    inputs: inputs
+                        .iter()
+                        .map(|reader| relative_dir(&root, &reader.part().dir).unwrap())
+                        .collect(),
+                };
+                write_record(&root, "recovery-output", &record).unwrap();
+            }
+
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "series_merge::tests::metric_compaction_fault_helper",
+                    "--nocapture",
+                ])
+                .env("SIGNY_TEST_COMPACTION_CRASH_POINT", point)
+                .env("SIGNY_TEST_COMPACTION_ROOT", &root)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "fault point {point} did not terminate the child");
+
+            for _ in 0..3 {
+                recover_local_compactions(&root).unwrap();
+                let restarted = registry_over(&root);
+                assert_eq!(all_samples(&restarted), before, "fault point {point}");
+            }
+            assert!(read_records(&root).unwrap().is_empty());
+            assert!(std::fs::read_dir(compact_dir(&root))
+                .unwrap()
+                .all(|entry| entry.unwrap().path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_compaction_fault_helper() {
+        let Some(root) = std::env::var_os("SIGNY_TEST_COMPACTION_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT").as_deref()
+            == Ok("recovery_record_processing")
+        {
+            recover_local_compactions(&root).unwrap();
+        } else {
+            let registry = registry_over(&root);
+            compact_once(&registry, &root, None).await.unwrap();
+        }
     }
 }

@@ -41,6 +41,9 @@ pub struct RuntimeMetrics {
     pub ingest_dropped_no_tenant: AtomicU64,
     pub ingest_dropped_invalid_tenant: AtomicU64,
     pub ingest_dropped_tenant_not_served: AtomicU64,
+    pub ingest_dropped_tenant_not_served_logs: AtomicU64,
+    pub ingest_dropped_tenant_not_served_traces: AtomicU64,
+    pub ingest_dropped_tenant_not_served_metrics: AtomicU64,
     /// Writes refused because the tenant is already storing everything its plan
     /// sells. It clears only when retention retires parts, which is why the
     /// refusal carries a long Retry-After.
@@ -188,6 +191,9 @@ impl RuntimeMetrics {
             ingest_dropped_no_tenant: AtomicU64::new(0),
             ingest_dropped_invalid_tenant: AtomicU64::new(0),
             ingest_dropped_tenant_not_served: AtomicU64::new(0),
+            ingest_dropped_tenant_not_served_logs: AtomicU64::new(0),
+            ingest_dropped_tenant_not_served_traces: AtomicU64::new(0),
+            ingest_dropped_tenant_not_served_metrics: AtomicU64::new(0),
             query_quota_rejected: AtomicU64::new(0),
             storage_limit_rejected: AtomicU64::new(0),
             wal_replayed_records: AtomicU64::new(0),

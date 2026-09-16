@@ -73,6 +73,13 @@ impl Dropped {
         metrics
             .ingest_dropped_tenant_not_served
             .fetch_add(self.tenant_not_served, Relaxed);
+        let tenant_not_served_by_signal = match signal {
+            "logs" => &metrics.ingest_dropped_tenant_not_served_logs,
+            "traces" => &metrics.ingest_dropped_tenant_not_served_traces,
+            "metrics" => &metrics.ingest_dropped_tenant_not_served_metrics,
+            _ => return,
+        };
+        tenant_not_served_by_signal.fetch_add(self.tenant_not_served, Relaxed);
         tracing::warn!(
             signal,
             attribute = TENANT_ATTRIBUTE,

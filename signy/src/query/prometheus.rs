@@ -165,6 +165,9 @@ signy_collect_skipped_records_total {}\n\
 signy_ingest_dropped_resources_total{{reason=\"no_tenant\"}} {}\n\
 signy_ingest_dropped_resources_total{{reason=\"invalid_tenant\"}} {}\n\
 signy_ingest_dropped_resources_total{{reason=\"tenant_not_served\"}} {}\n\
+signy_ingest_dropped_resources_total{{reason=\"tenant_not_served\",signal=\"logs\"}} {}\n\
+signy_ingest_dropped_resources_total{{reason=\"tenant_not_served\",signal=\"traces\"}} {}\n\
+signy_ingest_dropped_resources_total{{reason=\"tenant_not_served\",signal=\"metrics\"}} {}\n\
 # HELP signy_query_quota_rejected_total Queries refused by the tenant's own concurrency limit, as opposed to queries this instance failed to answer.\n\
 # TYPE signy_query_quota_rejected_total counter\n\
 signy_query_quota_rejected_total {}\n\
@@ -292,6 +295,9 @@ signy_build_info{{version=\"{}\",revision=\"{}\"}} 1\n\
         m.ingest_dropped_no_tenant.load(Ordering::Relaxed),
         m.ingest_dropped_invalid_tenant.load(Ordering::Relaxed),
         m.ingest_dropped_tenant_not_served.load(Ordering::Relaxed),
+        m.ingest_dropped_tenant_not_served_logs.load(Ordering::Relaxed),
+        m.ingest_dropped_tenant_not_served_traces.load(Ordering::Relaxed),
+        m.ingest_dropped_tenant_not_served_metrics.load(Ordering::Relaxed),
         m.query_quota_rejected.load(Ordering::Relaxed),
         m.storage_limit_rejected.load(Ordering::Relaxed),
         m.wal_replayed_records.load(Ordering::Relaxed),

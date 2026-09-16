@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
+use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
 use crate::config::Config;
 use crate::object_storage::{MetricManifestPart, RemoteCache, is_inputs_changed_error};
 use crate::series_part::{self, SeriesPartReader};
@@ -33,10 +34,15 @@ use crate::series_registry::SeriesRegistry;
 use crate::shutdown::wait_for_drain;
 
 pub const COMPACT_MIN_PARTS: usize = 8;
-/// Inputs per pass, bounding the samples a single compaction materializes.
-const COMPACT_MAX_PARTS: usize = 16;
-const L0_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const L1_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Metric parts hold chunked samples rather than rows, so a pass reads more
+/// per byte than the other signals do; the part count and the input bytes are
+/// what bound what one compaction materializes.
+const TIER_POLICY: TierPolicy = TierPolicy {
+    max_part_bytes: 256 * 1024 * 1024,
+    min_parts: COMPACT_MIN_PARTS,
+    max_parts: 16,
+    max_input_bytes: 256 * 1024 * 1024,
+};
 const COMPACT_DIR: &str = ".compact";
 
 /// Durable intent: the replacement is in `new`, the inputs it supersedes in
@@ -60,39 +66,29 @@ fn sample_bounds(samples: &[(i64, f64)]) -> Option<(i64, i64)> {
     Some((first.min(last), first.max(last)))
 }
 
-fn tier_of(bytes: u64) -> u8 {
-    if bytes < L0_MAX_BYTES {
-        0
-    } else if bytes < L1_MAX_BYTES {
-        1
-    } else {
-        2
-    }
-}
-
-/// The first (partition, tier) holding at least [`COMPACT_MIN_PARTS`] parts,
-/// smallest parts first so a pass retires the most part-count per byte read.
+/// The parts one pass rewrites, chosen by [`crate::compaction_tier`].
 pub(crate) fn select_inputs(
     readers: &[Arc<SeriesPartReader>],
+    now_ns: i64,
 ) -> Option<Vec<Arc<SeriesPartReader>>> {
-    let mut groups: std::collections::BTreeMap<(String, u8), Vec<Arc<SeriesPartReader>>> =
-        std::collections::BTreeMap::new();
-    for reader in readers {
-        let meta = &reader.part().meta;
-        groups
-            .entry((meta.partition.clone(), tier_of(chunk_bytes(meta))))
-            .or_default()
-            .push(reader.clone());
-    }
-    for (_, mut group) in groups {
-        if group.len() < COMPACT_MIN_PARTS {
-            continue;
-        }
-        group.sort_by_key(|reader| chunk_bytes(&reader.part().meta));
-        group.truncate(COMPACT_MAX_PARTS);
-        return Some(group);
-    }
-    None
+    let candidates: Vec<TierCandidate> = readers
+        .iter()
+        .map(|reader| {
+            let meta = &reader.part().meta;
+            TierCandidate {
+                partition: meta.partition.clone(),
+                bytes: chunk_bytes(meta),
+                max_ts_ns: meta.max_ts_ns,
+            }
+        })
+        .collect();
+    let selected = select_tier(&candidates, &TIER_POLICY, now_ns)?;
+    Some(
+        selected
+            .into_iter()
+            .map(|index| readers[index].clone())
+            .collect(),
+    )
 }
 
 pub(crate) fn compact_dir(metrics_root: &Path) -> PathBuf {
@@ -205,7 +201,8 @@ pub async fn compact_once(
     metrics_root: &Path,
     remote: Option<&RemoteCache>,
 ) -> Result<bool, String> {
-    let Some(inputs) = select_inputs(&registry.snapshot()) else {
+    let Some(inputs) = select_inputs(&registry.snapshot(), crate::clock::Clock::system().now_ns())
+    else {
         return Ok(false);
     };
 
@@ -359,6 +356,11 @@ pub async fn compact_loop(
 
 #[cfg(test)]
 mod tests {
+    /// The fixtures' own wall clock. Selection reads it to tell a partition
+    /// still being written from one nothing has touched for an hour, and the
+    /// fixtures date their rows rather than using the real clock.
+    const FIXTURE_NOW_NS: i64 = 1_772_000_000_000_000_000;
+
     use super::*;
     use crate::series::{
         METRIC_NAME_LABEL, MetricSample, MetricValue, SampleKind, SeriesLabels, SeriesMemTable,
@@ -432,7 +434,7 @@ mod tests {
         }
         let registry = registry_over(&root);
         assert!(
-            select_inputs(&registry.snapshot()).is_none(),
+            select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).is_none(),
             "{} parts are one short of the tier",
             COMPACT_MIN_PARTS - 1
         );
@@ -444,7 +446,7 @@ mod tests {
         );
         let registry = registry_over(&root);
         assert_eq!(
-            select_inputs(&registry.snapshot()).map(|inputs| inputs.len()),
+            select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).map(|inputs| inputs.len()),
             Some(COMPACT_MIN_PARTS)
         );
         std::fs::remove_dir_all(&root).ok();
@@ -500,7 +502,7 @@ mod tests {
             flush_one_part(&root, &series, 1_772_000_000_000_000_000, 4);
         }
         let registry = registry_over(&root);
-        let inputs = select_inputs(&registry.snapshot()).expect("the tier is complete");
+        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).expect("the tier is complete");
         let mut expected = Vec::new();
         for reader in &inputs {
             expected.extend(
@@ -538,7 +540,7 @@ mod tests {
         }
         let registry = registry_over(&root);
         let before = all_samples(&registry);
-        let inputs = select_inputs(&registry.snapshot()).unwrap();
+        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
 
         // The crash window, simulated by hand: the replacement is durable and
         // the record exists, but no input was removed.
@@ -611,7 +613,7 @@ mod tests {
             );
         }
         let registry = registry_over(&root);
-        let inputs = select_inputs(&registry.snapshot()).unwrap();
+        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
         let new_parts = series_part::compact_series_parts(&inputs, &root).unwrap();
         let record = CompactRecord {
             new: new_parts

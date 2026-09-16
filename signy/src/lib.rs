@@ -5,6 +5,7 @@ mod backpressure;
 pub mod bloom;
 pub mod clock;
 mod collect;
+mod compaction_tier;
 pub mod config;
 mod disk;
 // Shared with `benches/` and `bin/load`. One generator, so a load result and a

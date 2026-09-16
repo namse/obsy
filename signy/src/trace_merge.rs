@@ -21,7 +21,7 @@
 //! deleted here, so a query that planned against an input before the
 //! replacement landed can still restore it for the length of the grace period.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::interval;
 
+use crate::compaction_tier::{TierCandidate, TierPolicy, select_tier};
 use crate::config::Config;
 use crate::object_storage::{RemoteCache, TraceManifestPart, is_inputs_changed_error};
 use crate::shutdown::wait_for_drain;
@@ -37,12 +38,16 @@ use crate::trace_part::{self, TracePartReader};
 use crate::trace_registry::TraceRegistry;
 
 pub const COMPACT_MIN_PARTS: usize = 8;
-const COMPACT_MAX_PARTS: usize = 32;
-/// Stored bytes one pass reads. A decoded span is several times its stored
-/// size, so this is what bounds the pass's memory rather than the part count.
-const COMPACT_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
-const L0_MAX_BYTES: u64 = 1024 * 1024;
-const L1_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Trace parts are small and a pass reads them whole, so the size tiers are
+/// the shared ones and only the ceilings are trace-specific. `max_input_bytes`
+/// is stored bytes: a decoded span is several times its stored size, which is
+/// what bounds the pass's memory rather than the part count.
+const TIER_POLICY: TierPolicy = TierPolicy {
+    max_part_bytes: 16 * 1024 * 1024,
+    min_parts: COMPACT_MIN_PARTS,
+    max_parts: 32,
+    max_input_bytes: 16 * 1024 * 1024,
+};
 const COMPACT_DIR: &str = ".compact";
 const SPAN_DECODE_EXPANSION: u64 = 8;
 
@@ -64,53 +69,26 @@ fn stored_bytes(reader: &TracePartReader) -> u64 {
         .sum()
 }
 
-/// `None` for a part already at the largest tier: rewriting large parts
-/// together costs a full read for no reduction in part count that matters.
-fn tier_of(bytes: u64) -> Option<u8> {
-    if bytes < L0_MAX_BYTES {
-        Some(0)
-    } else if bytes < L1_MAX_BYTES {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-/// The first (partition, tier) holding at least [`COMPACT_MIN_PARTS`] parts,
-/// smallest first, cut at [`COMPACT_MAX_PARTS`] and [`COMPACT_MAX_INPUT_BYTES`].
-pub(crate) fn select_inputs(readers: &[Arc<TracePartReader>]) -> Option<Vec<Arc<TracePartReader>>> {
-    let mut groups: BTreeMap<(String, u8), Vec<Arc<TracePartReader>>> = BTreeMap::new();
-    for reader in readers {
-        let Some(tier) = tier_of(stored_bytes(reader)) else {
-            continue;
-        };
-        groups
-            .entry((reader.part().meta.partition.clone(), tier))
-            .or_default()
-            .push(reader.clone());
-    }
-    for (_, mut group) in groups {
-        if group.len() < COMPACT_MIN_PARTS {
-            continue;
-        }
-        group.sort_by_key(|reader| stored_bytes(reader));
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0u64;
-        for reader in group {
-            let bytes = stored_bytes(&reader);
-            if selected.len() == COMPACT_MAX_PARTS
-                || (!selected.is_empty() && selected_bytes + bytes > COMPACT_MAX_INPUT_BYTES)
-            {
-                break;
-            }
-            selected_bytes += bytes;
-            selected.push(reader);
-        }
-        if selected.len() >= 2 {
-            return Some(selected);
-        }
-    }
-    None
+/// The parts one pass rewrites, chosen by [`crate::compaction_tier`].
+pub(crate) fn select_inputs(
+    readers: &[Arc<TracePartReader>],
+    now_ns: i64,
+) -> Option<Vec<Arc<TracePartReader>>> {
+    let candidates: Vec<TierCandidate> = readers
+        .iter()
+        .map(|reader| TierCandidate {
+            partition: reader.part().meta.partition.clone(),
+            bytes: stored_bytes(reader),
+            max_ts_ns: reader.part().meta.max_ts_ns,
+        })
+        .collect();
+    let selected = select_tier(&candidates, &TIER_POLICY, now_ns)?;
+    Some(
+        selected
+            .into_iter()
+            .map(|index| readers[index].clone())
+            .collect(),
+    )
 }
 
 pub(crate) fn compact_dir(traces_root: &Path) -> PathBuf {
@@ -312,7 +290,7 @@ pub async fn compact_once(
     config: &Config,
 ) -> Result<bool, String> {
     let _deletion_guard = deletion_lock.read_owned().await;
-    let Some(inputs) = select_inputs(&registry.snapshot()) else {
+    let Some(inputs) = select_inputs(&registry.snapshot(), crate::clock::Clock::system().now_ns()) else {
         return Ok(false);
     };
     if !inputs_still_registered(registry, &inputs) {
@@ -458,6 +436,11 @@ pub async fn compact_loop(
 
 #[cfg(test)]
 mod tests {
+    /// The fixtures' own wall clock. Selection reads it to tell a partition
+    /// still being written from one nothing has touched for an hour, and the
+    /// fixtures date their rows rather than using the real clock.
+    const FIXTURE_NOW_NS: i64 = 1_772_000_000_000_000_000;
+
     use super::*;
     use crate::tenant::test_tenant;
     use crate::trace::{TraceSpan, normalize_request};
@@ -519,13 +502,13 @@ mod tests {
         }
         let registry =
             TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(()))).unwrap();
-        assert!(select_inputs(&registry.snapshot()).is_none());
+        assert!(select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).is_none());
 
         flush_one_part(&root, COMPACT_MIN_PARTS);
         let registry =
             TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(()))).unwrap();
         assert_eq!(
-            select_inputs(&registry.snapshot()).map(|inputs| inputs.len()),
+            select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).map(|inputs| inputs.len()),
             Some(COMPACT_MIN_PARTS)
         );
         std::fs::remove_dir_all(&root).ok();
@@ -642,7 +625,7 @@ mod tests {
             TraceRegistry::load_from_disk(&traces_root, Arc::new(tokio::sync::RwLock::new(())))
                 .unwrap();
         let before = all_spans(&registry);
-        let inputs = select_inputs(&registry.snapshot()).unwrap();
+        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
         let spans = read_all_spans(&inputs).unwrap();
         let new_parts = trace_part::flush_trace_spans(&spans, &traces_root, 16).unwrap();
         let record = CompactRecord {
@@ -691,7 +674,7 @@ mod tests {
         let registry =
             TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(()))).unwrap();
         let before = all_spans(&registry);
-        let inputs = select_inputs(&registry.snapshot()).unwrap();
+        let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
         let spans = read_all_spans(&inputs).unwrap();
         let new_parts = trace_part::flush_trace_spans(&spans, &root, 16).unwrap();
         let record = CompactRecord {

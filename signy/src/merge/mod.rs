@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tokio::time::interval;
 
+use crate::compaction_tier::IDLE_PARTITION_AGE;
 use crate::config::Config;
 use crate::metrics::RuntimeMetrics;
 use crate::object_storage::RemoteCache;

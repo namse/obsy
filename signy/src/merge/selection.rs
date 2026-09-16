@@ -10,6 +10,7 @@ pub fn merge_debt_part_count(
     config: &Config,
     cutoffs: Option<&Cutoffs>,
     deletes: &crate::delete_requests::DeleteMasks,
+    now_ns: i64,
 ) -> usize {
     let readers = registry.snapshot();
     if readers.is_empty() {
@@ -25,7 +26,7 @@ pub fn merge_debt_part_count(
     let mut debt = 0usize;
     for (_partition, mut parts) in by_partition {
         parts.sort_by_key(|reader| reader.meta().row_count);
-        for group in select_groups(&parts, config, cutoffs, deletes) {
+        for group in select_groups(&parts, config, cutoffs, deletes, now_ns) {
             debt += group.parts.len();
         }
     }
@@ -63,8 +64,16 @@ fn select_groups(
     config: &Config,
     cutoffs: Option<&Cutoffs>,
     deletes: &crate::delete_requests::DeleteMasks,
+    now_ns: i64,
 ) -> Vec<MergeGroup> {
     let min_part_count = config.merge_min_part_count.max(2);
+    // A partition nothing has written to for an hour will not fill a tier by
+    // itself, and leaving its handful of parts unmerged costs every query that
+    // opens them.
+    let idle_before_ns = now_ns.saturating_sub(IDLE_PARTITION_AGE.as_nanos() as i64);
+    let partition_is_idle = parts
+        .iter()
+        .all(|reader| reader.meta().max_ts_ns < idle_before_ns);
     let needs_rewrite = |reader: &Arc<PartReader>| {
         if deletes.may_cover_part(reader.meta()) {
             return true;
@@ -79,14 +88,15 @@ fn select_groups(
     let mut selected: Vec<MergeGroup> = Vec::new();
     let mut grouped: std::collections::HashSet<String> = std::collections::HashSet::new();
     for group in group_for_merge(parts, config) {
-        if group.len() < min_part_count && !group.iter().any(needs_rewrite) {
+        let age_admits = partition_is_idle && group.len() >= 2;
+        if group.len() < min_part_count && !age_admits && !group.iter().any(needs_rewrite) {
             continue;
         }
         for reader in &group {
             grouped.insert(reader.meta().id.clone());
         }
         selected.push(MergeGroup {
-            retention_only: group.len() < min_part_count,
+            retention_only: group.len() < min_part_count && !age_admits,
             parts: group,
         });
     }
@@ -101,7 +111,31 @@ fn select_groups(
     selected
 }
 
+/// Groups within one size tier, never across them.
+///
+/// Grouping by row count alone put the part a partition has been accumulating
+/// into a group with each flush's new parts, so every pass rewrote the whole
+/// of it to absorb a few rows. See [`crate::compaction_tier`].
 fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<PartReader>>> {
+    let mut by_tier: std::collections::BTreeMap<u32, Vec<Arc<PartReader>>> =
+        std::collections::BTreeMap::new();
+    for reader in parts {
+        if reader.meta().row_count >= config.merge_max_part_rows {
+            // Do not add an already-large part to a merge group.
+            continue;
+        }
+        by_tier
+            .entry(crate::compaction_tier::tier_of(estimated_part_bytes(reader)))
+            .or_default()
+            .push(reader.clone());
+    }
+    by_tier
+        .into_values()
+        .flat_map(|tier| group_within_tier(&tier, config))
+        .collect()
+}
+
+fn group_within_tier(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<PartReader>>> {
     let mut groups: Vec<Vec<Arc<PartReader>>> = Vec::new();
     let mut current: Vec<Arc<PartReader>> = Vec::new();
     let mut current_rows: u64 = 0;
@@ -119,11 +153,6 @@ fn group_for_merge(parts: &[Arc<PartReader>], config: &Config) -> Vec<Vec<Arc<Pa
         / MIN_STREAM_PAGE_BYTES)
         .max(min_part_count as u64) as usize;
     for r in parts {
-        if r.meta().row_count >= config.merge_max_part_rows {
-            // Do not add an already-large part to a merge group.
-            continue;
-        }
-
         let next_rows = current_rows.saturating_add(r.meta().row_count);
         let next_bytes = current_bytes.saturating_add(estimated_part_bytes(r));
         if current.len() >= min_part_count && next_bytes > config.merge_max_input_bytes {

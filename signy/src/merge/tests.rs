@@ -1,5 +1,10 @@
     use super::*;
     use crate::delete_requests::DeleteMasks;
+    /// The fixtures' own wall clock: selection reads it to tell a partition
+    /// still being written from one nothing has touched for an hour.
+    const FIXTURE_NOW_NS: i64 = 1_700_000_000_000_000_000;
+    /// The same, for the fixtures that date their rows from the epoch.
+    const EPOCH_FIXTURE_NOW_NS: i64 = 0;
     use crate::tenant::test_tenant;
     use crate::config::Config;
     use crate::memtable::Labels;
@@ -44,7 +49,7 @@
         }
         assert_eq!(registry.part_count(), 5);
 
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
 
@@ -84,7 +89,7 @@
         let merge_registry = registry.clone();
         let merge_config = config.clone();
         let mut merge =
-            tokio::spawn(async move { merge_once_without_retention(&merge_registry, None, &merge_config).await });
+            tokio::spawn(async move { merge_once_without_retention(&merge_registry, None, &merge_config, FIXTURE_NOW_NS).await });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut merge)
                 .await
@@ -120,7 +125,9 @@
         }
         assert_eq!(registry.part_count(), 2);
 
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, EPOCH_FIXTURE_NOW_NS)
+            .await
+            .unwrap();
 
         assert_eq!(registry.part_count(), 2);
     }
@@ -178,6 +185,7 @@
                 &DeleteMasks::default(),
                 None,
                 &RuntimeMetrics::new(),
+                EPOCH_FIXTURE_NOW_NS,
             )
             .await
             .unwrap();
@@ -241,7 +249,7 @@
         let before = registry.layout_totals();
         assert_eq!(before.tenant_segments, 20, "five tenants in each of four parts");
 
-        merge_once_without_retention(&registry, None, &config)
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -322,7 +330,7 @@
         }
         assert_eq!(registry.part_count(), 4);
 
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let results = registry
@@ -357,7 +365,7 @@
             registry.register(parts).unwrap();
         }
 
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS).await.unwrap();
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);
@@ -392,7 +400,7 @@
             let parts = part::flush_rows(rows, &parts_root, config.row_group_size).unwrap();
             registry.register(parts).unwrap();
         }
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS).await.unwrap();
         assert_eq!(registry.part_count(), 1);
 
         // bloom prune after merge
@@ -435,7 +443,7 @@
             registry.register(parts).unwrap();
         }
 
-        merge_once_without_retention(&registry, None, &config).await.unwrap();
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS).await.unwrap();
 
         assert_eq!(registry.part_count(), 1);
         let rows = read_all_rows(&registry.snapshot()).unwrap();
@@ -569,7 +577,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -653,7 +661,7 @@
             ("beta", crate::tenant_policy::TenantRetention::Infinite),
         ]);
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new(), FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -700,7 +708,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -728,7 +736,7 @@
         // The rows are gone, so the next tick has nothing left to reclaim and
         // must not copy the part onto itself.
         let rewritten_id = reader.meta().id.clone();
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
         assert_eq!(registry.snapshot()[0].meta().id, rewritten_id);
@@ -765,7 +773,7 @@
             crate::tenant_policy::TenantRetention::Finite(std::time::Duration::from_nanos(1)),
         )]);
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new())
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &RuntimeMetrics::new(), FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -877,7 +885,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -967,7 +975,7 @@
         ]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -1040,6 +1048,7 @@
             &DeleteMasks::default(),
             None,
             &metrics,
+            FIXTURE_NOW_NS,
         )
         .await
         .expect("a replaced input is skipped, not reported as a merge failure");
@@ -1125,7 +1134,7 @@
         )]);
         let metrics = RuntimeMetrics::new();
 
-        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics)
+        merge_once(&registry, None, &config, &policy, &DeleteMasks::default(), None, &metrics, FIXTURE_NOW_NS)
             .await
             .unwrap();
 
@@ -1173,7 +1182,7 @@
         registry.register(parts).unwrap();
 
         assert_eq!(
-            merge_debt_part_count(&registry, &config, None, &DeleteMasks::default()),
+            merge_debt_part_count(&registry, &config, None, &DeleteMasks::default(), FIXTURE_NOW_NS),
             0,
             "with no policy there is no debt: the group is below the minimum"
         );
@@ -1184,7 +1193,13 @@
         )]);
         let cutoffs = policy.cutoffs_now().unwrap();
         assert_eq!(
-            merge_debt_part_count(&registry, &config, Some(&cutoffs), &DeleteMasks::default()),
+            merge_debt_part_count(
+                &registry,
+                &config,
+                Some(&cutoffs),
+                &DeleteMasks::default(),
+                FIXTURE_NOW_NS,
+            ),
             1,
             "the part two thirds of which has expired is pending merge work"
         );
@@ -1231,6 +1246,7 @@
             &requests.masks(),
             None,
             &RuntimeMetrics::new(),
+            FIXTURE_NOW_NS,
         )
         .await
         .unwrap();
@@ -1302,6 +1318,7 @@
             &DeleteMasks::default(),
             Some(&draining),
             &RuntimeMetrics::new(),
+            FIXTURE_NOW_NS,
         )
         .await
         .unwrap();
@@ -1322,6 +1339,7 @@
             &DeleteMasks::default(),
             Some(&running),
             &RuntimeMetrics::new(),
+            FIXTURE_NOW_NS,
         )
         .await
         .unwrap();
@@ -1362,6 +1380,7 @@
             &DeleteMasks::default(),
             None,
             &RuntimeMetrics::new(),
+            FIXTURE_NOW_NS,
         )
         .await
         .unwrap();
@@ -1381,6 +1400,7 @@
             &requests.masks(),
             None,
             &RuntimeMetrics::new(),
+            FIXTURE_NOW_NS,
         )
         .await
         .unwrap();
@@ -1427,7 +1447,7 @@
 
         // The rewrite fails on the vanished input, and that must be a benign
         // skip: no Err from the iteration, and the surviving parts untouched.
-        merge_once_without_retention(&registry, None, &config)
+        merge_once_without_retention(&registry, None, &config, FIXTURE_NOW_NS)
             .await
             .expect("a retention-deleted input is a skip, not a merge error");
     }

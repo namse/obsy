@@ -29,6 +29,7 @@ pub async fn merge_loop(
             &masks,
             Some(&drain_rx),
             &metrics,
+            crate::clock::Clock::system().now_ns(),
         )
         .await
         {
@@ -60,6 +61,7 @@ async fn merge_once_without_retention(
     registry: &PartRegistry,
     remote_cache: Option<&RemoteCache>,
     config: &Config,
+    now_ns: i64,
 ) -> Result<(), String> {
     merge_once(
         registry,
@@ -69,10 +71,12 @@ async fn merge_once_without_retention(
         &crate::delete_requests::DeleteMasks::default(),
         None,
         &RuntimeMetrics::new(),
+        now_ns,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn merge_once(
     registry: &PartRegistry,
     remote_cache: Option<&RemoteCache>,
@@ -81,6 +85,7 @@ async fn merge_once(
     deletes: &crate::delete_requests::DeleteMasks,
     drain: Option<&watch::Receiver<bool>>,
     metrics: &RuntimeMetrics,
+    now_ns: i64,
 ) -> Result<(), String> {
     let readers = registry.snapshot();
     if readers.is_empty() {
@@ -97,7 +102,7 @@ async fn merge_once(
     // and the cutoffs, and it runs whether or not the previous one succeeded,
     // so a stalled merge still shows its backlog growing.
     metrics.merge_debt_parts.store(
-        merge_debt_part_count(registry, config, cutoffs.as_ref(), deletes) as u64,
+        merge_debt_part_count(registry, config, cutoffs.as_ref(), deletes, now_ns) as u64,
         Ordering::Relaxed,
     );
 
@@ -119,7 +124,7 @@ async fn merge_once(
         // Exclude an oversized single part (it is already large enough).
         // Group small parts for merging. Simplification: within a partition, group from the smallest
         // parts until merge_target_part_rows is reached once there are at least merge_min_part_count.
-        let groups = select_groups(&parts, config, cutoffs.as_ref(), deletes);
+        let groups = select_groups(&parts, config, cutoffs.as_ref(), deletes, now_ns);
         for MergeGroup {
             parts: group,
             retention_only,

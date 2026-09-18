@@ -172,10 +172,11 @@ Three properties make the second half cheap:
 PUT /signy/api/v1/admin/tenants/{tenant}/retention
 Content-Type: application/json
 
-{"retention": "30d"}
+{"revision": 1, "retention": "30d"}
 
-200 OK    the policy is durable and in force
+200 OK    the policy is durable and in force; the response names applied, duplicate, or stale
 400       malformed tenant id or retention value; nothing stored
+409       the revision already names a different policy body
 503       could not be persisted; the control plane must retry
 ```
 

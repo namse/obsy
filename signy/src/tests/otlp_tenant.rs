@@ -37,7 +37,7 @@ async fn serving(tenants: &[&str]) -> TenantPolicy {
     let policy = TenantPolicy::enabled_with_clock(crate::clock::Clock::system());
     for tenant in tenants {
         policy
-            .push(&TenantId::parse(tenant).unwrap(), "30d", None)
+            .push(&TenantId::parse(tenant).unwrap(), 1, "30d", None)
             .await
             .expect("a policy push onboards the tenant");
     }

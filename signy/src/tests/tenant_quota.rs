@@ -207,7 +207,7 @@
         let clock = Clock::fixed(0);
         let policy = Arc::new(TenantPolicy::enabled_with_clock(clock));
         policy
-            .push(&tenant("acme"), "7d", Some(&format!("{}", stored * 4)))
+            .push(&tenant("acme"), 1, "7d", Some(&format!("{}", stored * 4)))
             .await
             .unwrap();
         let config = Config {

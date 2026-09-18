@@ -58,6 +58,7 @@ pub enum TenantStorageLimit {
 /// otherwise reinterprets the values it pushed.
 #[derive(Clone)]
 struct PolicyEntry {
+    revision: u64,
     retention: TenantRetention,
     raw: String,
     /// Bytes the tenant may keep stored, or `None` when the control plane has
@@ -71,6 +72,7 @@ struct PolicyEntry {
 impl PolicyEntry {
     fn view(&self) -> PolicyView {
         PolicyView {
+            revision: self.revision,
             retention: self.raw.clone(),
             max_stored_bytes: self.raw_max_stored_bytes.clone(),
             updated_at: self.updated_at,
@@ -79,7 +81,9 @@ impl PolicyEntry {
 }
 
 /// One tenant's policy as the admin endpoints report it.
+#[derive(Debug)]
 pub struct PolicyView {
+    pub revision: u64,
     pub retention: String,
     pub max_stored_bytes: Option<String>,
     pub updated_at: SystemTime,
@@ -272,6 +276,16 @@ pub enum PolicyError {
     /// The policy could not be made durable. Nothing was applied, and the
     /// control plane owns the retry.
     Persist(String),
+    RevisionConflict {
+        revision: u64,
+    },
+}
+
+#[derive(Debug)]
+pub enum PushResult {
+    Applied(PolicyView),
+    Duplicate(PolicyView),
+    Stale(PolicyView),
 }
 
 /// Where the policy objects live.
@@ -288,6 +302,8 @@ enum PolicyStore {
 
 #[derive(Serialize, Deserialize)]
 struct PolicyDocument {
+    #[serde(default)]
+    revision: u64,
     retention: String,
     /// Absent in every policy stored before limits existed. `default` rather
     /// than required, because a stored policy that suddenly fails to
@@ -389,6 +405,7 @@ impl PolicyStore {
             entries.insert(
                 tenant,
                 PolicyEntry {
+                    revision: document.revision,
                     retention,
                     raw: document.retention,
                     max_stored_bytes,
@@ -595,9 +612,10 @@ impl TenantPolicy {
     pub async fn push(
         &self,
         tenant: &TenantId,
+        revision: u64,
         raw: &str,
         raw_max_stored_bytes: Option<&str>,
-    ) -> Result<PolicyView, PolicyError> {
+    ) -> Result<PushResult, PolicyError> {
         let Some(store) = &self.store else {
             return Err(PolicyError::Invalid(
                 "per-tenant retention is not enabled".to_string(),
@@ -625,8 +643,23 @@ impl TenantPolicy {
         // wait could let the one that commits last store the older `updated_at`
         // and walk the push age backwards.
         let _guard = self.write_lock.lock().await;
+        if let Some(current) = self.policies.read().entries.get(tenant).cloned() {
+            match revision.cmp(&current.revision) {
+                std::cmp::Ordering::Less => {
+                    return Ok(PushResult::Stale(current.view()));
+                }
+                std::cmp::Ordering::Equal => {
+                    if current.raw == raw && current.raw_max_stored_bytes == raw_max_stored_bytes {
+                        return Ok(PushResult::Duplicate(current.view()));
+                    }
+                    return Err(PolicyError::RevisionConflict { revision });
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
         let updated_at = self.clock.now();
         let document = PolicyDocument {
+            revision,
             retention: raw.clone(),
             max_stored_bytes: raw_max_stored_bytes.clone(),
             updated_at: format_timestamp(updated_at),
@@ -641,6 +674,7 @@ impl TenantPolicy {
             entries.insert(
                 tenant.clone(),
                 PolicyEntry {
+                    revision,
                     retention,
                     raw: raw.clone(),
                     max_stored_bytes,
@@ -650,11 +684,12 @@ impl TenantPolicy {
             );
         });
         self.metrics.push_accepted.fetch_add(1, Ordering::Relaxed);
-        Ok(PolicyView {
+        Ok(PushResult::Applied(PolicyView {
+            revision,
             retention: raw,
             max_stored_bytes: raw_max_stored_bytes,
             updated_at,
-        })
+        }))
     }
 
     pub fn max_stored_bytes(&self, tenant: &TenantId) -> Option<TenantStorageLimit> {
@@ -708,6 +743,7 @@ impl TenantPolicy {
                 entries.insert(
                     tenant,
                     PolicyEntry {
+                        revision: 0,
                         retention,
                         raw,
                         max_stored_bytes: None,
@@ -929,7 +965,7 @@ mod tests {
         let policy = TenantPolicy::for_test_with_store(storage.clone());
         assert!(!policy.is_tenant_allowed(&tenant("acme")));
 
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "30d", None).await.unwrap();
         assert!(policy.is_tenant_allowed(&tenant("acme")));
         assert!(!policy.is_tenant_allowed(&tenant("stranger")));
 
@@ -946,13 +982,13 @@ mod tests {
     async fn a_push_is_durable_and_survives_a_restart() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "30d", None).await.unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None)
+            .push(&tenant("intern"), 1, "infinite", None)
             .await
             .unwrap();
         // A downgrade taken before the restart must still be in force after it.
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy.push(&tenant("acme"), 2, "7d", None).await.unwrap();
         assert_eq!(
             policy.metrics.push_accepted.load(Ordering::Relaxed),
             3,
@@ -973,6 +1009,70 @@ mod tests {
             Some(TenantRetention::Infinite)
         );
         assert_eq!(map.view(&tenant("acme")).unwrap().retention, "7d");
+    }
+
+    #[tokio::test]
+    async fn revision_fence_accepts_newer_retries_and_rejects_older_payloads() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        let policy = TenantPolicy::for_test_with_store(storage);
+
+        assert!(matches!(
+            policy.push(&tenant("acme"), 1, "30d", None).await,
+            Ok(PushResult::Applied(_))
+        ));
+        assert!(matches!(
+            policy.push(&tenant("acme"), 2, "7d", None).await,
+            Ok(PushResult::Applied(_))
+        ));
+        assert!(matches!(
+            policy.push(&tenant("acme"), 1, "30d", None).await,
+            Ok(PushResult::Stale(view)) if view.revision == 2
+        ));
+        assert!(matches!(
+            policy.push(&tenant("acme"), 2, "7d", None).await,
+            Ok(PushResult::Duplicate(view)) if view.revision == 2
+        ));
+        assert!(matches!(
+            policy.push(&tenant("acme"), 2, "14d", None).await,
+            Err(PolicyError::RevisionConflict { revision: 2 })
+        ));
+        assert_eq!(policy.view(&tenant("acme")).unwrap().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_revisions_converge_on_the_newest_policy() {
+        let policy = Arc::new(TenantPolicy::for_test_with_store(Arc::new(
+            ObjectStorage::in_memory(),
+        )));
+        let older_policy = policy.clone();
+        let newer_policy = policy.clone();
+        let tenant_id = tenant("acme");
+        let (older_result, newer_result) = tokio::join!(
+            older_policy.push(&tenant_id, 10, "10d", None),
+            newer_policy.push(&tenant_id, 11, "11d", None),
+        );
+
+        assert!(older_result.is_ok());
+        assert!(newer_result.is_ok());
+        let view = policy.view(&tenant("acme")).unwrap();
+        assert_eq!(view.revision, 11);
+        assert_eq!(view.retention, "11d");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_policy_loads_with_revision_zero() {
+        let storage = Arc::new(ObjectStorage::in_memory());
+        storage
+            .put_tenant_policy(
+                "acme",
+                br#"{"retention":"30d","updated_at":"2026-09-18T00:00:00Z"}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let policy = TenantPolicy::load(&Config::default(), Some(storage))
+            .await
+            .unwrap();
+        assert_eq!(policy.view(&tenant("acme")).unwrap().revision, 0);
     }
 
     #[test]
@@ -1002,7 +1102,7 @@ mod tests {
         let data_dir = tempdir("tenant-policy-local");
         let dir = data_dir.join(TENANT_POLICY_PREFIX);
         let policy = TenantPolicy::for_test_with_local_store(dir.clone());
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "7d", None).await.unwrap();
         assert_eq!(
             policy.snapshot().unwrap().retention(&tenant("acme")),
             Some(TenantRetention::Finite(days(7)))
@@ -1049,7 +1149,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "7d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "7d", None).await.unwrap();
 
         let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
         let floor = || policy.query_floor_ns(&tenant("acme")).expect("finite");
@@ -1086,7 +1186,7 @@ mod tests {
         let start_ns = 1_800_000_000_000_000_000i64;
         let clock = crate::clock::Clock::fixed(start_ns);
         let policy = TenantPolicy::enabled_with_clock(clock.clone());
-        policy.push(&tenant("acme"), "1d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "1d", None).await.unwrap();
 
         clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
         assert!(
@@ -1099,7 +1199,7 @@ mod tests {
 
         // The control plane upgrades the tenant. The row is still on disk, and
         // the new plan covers it again.
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy.push(&tenant("acme"), 2, "30d", None).await.unwrap();
         assert!(
             !policy
                 .cutoffs_now()
@@ -1113,11 +1213,11 @@ mod tests {
     async fn a_failing_store_changes_neither_the_map_nor_the_object() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "30d", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "30d", None).await.unwrap();
 
         // A malformed value is rejected before anything is written.
         assert!(matches!(
-            policy.push(&tenant("acme"), "soon", None).await,
+            policy.push(&tenant("acme"), 2, "soon", None).await,
             Err(PolicyError::Invalid(_))
         ));
         assert_eq!(policy.metrics.push_rejected.load(Ordering::Relaxed), 1);
@@ -1133,7 +1233,7 @@ mod tests {
     async fn a_delete_returns_the_tenant_to_unknown() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage.clone());
-        policy.push(&tenant("acme"), "1ms", None).await.unwrap();
+        policy.push(&tenant("acme"), 1, "1ms", None).await.unwrap();
         assert!(policy.query_floor_ns(&tenant("acme")).is_some());
 
         policy.remove(&tenant("acme")).await.unwrap();
@@ -1156,9 +1256,12 @@ mod tests {
     async fn nothing_reinterprets_a_pushed_value() {
         let storage = Arc::new(ObjectStorage::in_memory());
         let policy = TenantPolicy::for_test_with_store(storage);
-        policy.push(&tenant("acme"), "3650d", None).await.unwrap();
         policy
-            .push(&tenant("intern"), "infinite", None)
+            .push(&tenant("acme"), 1, "3650d", None)
+            .await
+            .unwrap();
+        policy
+            .push(&tenant("intern"), 1, "infinite", None)
             .await
             .unwrap();
 

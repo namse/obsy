@@ -285,7 +285,7 @@ and survive restarts; there is nothing to reload:
 ```
 curl -X PUT https://your-gateway/signy/api/v1/admin/tenants/acme/retention \
   -H 'Content-Type: application/json' \
-  -d '{"retention": "30d", "max_stored_bytes": "50GiB"}'
+  -d '{"revision": 1, "retention": "30d", "max_stored_bytes": "50GiB"}'
 ```
 
 The body is the whole policy, not a patch: a field left out is cleared.

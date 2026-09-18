@@ -999,7 +999,10 @@ async fn onboard_tenants(cfg: &Config, tenants: &[&str]) -> Result<(), String> {
         return Ok(());
     }
     let mut client = Client::new(&cfg.http_address, cfg.request_timeout());
-    let body = format!("{{\"retention\": \"{}\"}}", cfg.tenant_retention);
+    let body = format!(
+        "{{\"revision\": 1, \"retention\": \"{}\"}}",
+        cfg.tenant_retention
+    );
     for tenant in tenants {
         let path = format!("/signy/api/v1/admin/tenants/{tenant}/retention");
         let response = client

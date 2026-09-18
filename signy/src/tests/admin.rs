@@ -80,14 +80,45 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d"}"#,
+            r#"{"revision":1,"retention":"30d"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["tenant"], "acme");
+        assert_eq!(json["revision"], 1);
         assert_eq!(json["retention"], "30d");
+        assert_eq!(json["result"], "applied");
         assert!(json["updated_at"].as_str().is_some());
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":1,"retention":"30d"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["result"], "duplicate");
+
+        let (status, body) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":0,"retention":"7d"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["result"], "stale");
+
+        let (status, _) = call(
+            &state,
+            "PUT",
+            RETENTION_URI,
+            r#"{"revision":1,"retention":"7d"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
 
         // A 200 is a promise that the policy survives a restart.
         assert_eq!(storage.load_tenant_policies().await.unwrap().len(), 1);
@@ -124,7 +155,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d","max_stored_bytes":"10GiB"}"#,
+            r#"{"revision":1,"retention":"30d","max_stored_bytes":"10GiB"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -150,7 +181,7 @@
             "a limit that does not survive a restart is not a policy"
         );
 
-        let (status, body) = call(&state, "PUT", RETENTION_URI, r#"{"retention":"30d"}"#).await;
+        let (status, body) = call(&state, "PUT", RETENTION_URI, r#"{"revision":2,"retention":"30d"}"#).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             serde_json::from_str::<serde_json::Value>(&body)
@@ -170,7 +201,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"7d","max_stored_bytes":"plenty"}"#,
+            r#"{"revision":3,"retention":"7d","max_stored_bytes":"plenty"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -192,7 +223,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d"}"#,
+            r#"{"revision":1,"retention":"30d"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -227,7 +258,7 @@
             &state,
             "PUT",
             "/signy/api/v1/admin/tenants/..%2Fetc/retention",
-            r#"{"retention":"30d"}"#,
+            r#"{"revision":1,"retention":"30d"}"#,
         )
         .await;
         assert_eq!(
@@ -236,7 +267,7 @@
             "a tenant id is never propagated into a path"
         );
 
-        for body in [r#"{"retention":"soon"}"#, r#"{"retention":7}"#, "{}", "not json"] {
+        for body in [r#"{"revision":1,"retention":"soon"}"#, r#"{"revision":1,"retention":7}"#, "{}", "not json"] {
             let (status, _) = call(&state, "PUT", RETENTION_URI, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         }
@@ -257,7 +288,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d"}"#,
+            r#"{"revision":1,"retention":"30d"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -288,7 +319,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"infinite"}"#,
+            r#"{"revision":1,"retention":"infinite"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -426,7 +457,7 @@
             &state,
             "PUT",
             RETENTION_URI,
-            r#"{"retention":"30d"}"#,
+            r#"{"revision":1,"retention":"30d"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -467,11 +498,11 @@
         for (uri, request_body) in [
             (
                 "/signy/api/v1/admin/tenants/zeta/retention",
-                r#"{"retention":"7d","max_stored_bytes":"1GiB"}"#,
+                r#"{"revision":1,"retention":"7d","max_stored_bytes":"1GiB"}"#,
             ),
             (
                 "/signy/api/v1/admin/tenants/acme/retention",
-                r#"{"retention":"30d"}"#,
+                r#"{"revision":1,"retention":"30d"}"#,
             ),
         ] {
             let (status, _) = call(&state, "PUT", uri, request_body).await;

@@ -169,7 +169,7 @@
             crate::clock::Clock::system(),
         ));
         tenant_policy
-            .push(&test_tenant(), "30d", None)
+            .push(&test_tenant(), 1, "30d", None)
             .await
             .expect("the test tenant is onboarded by pushing a policy");
         let state = crate::test_support::state_with_tenant_policy(
@@ -955,7 +955,7 @@
             crate::clock::Clock::system(),
         ));
         tenant_policy
-            .push(&test_tenant(), "30d", None)
+            .push(&test_tenant(), 1, "30d", None)
             .await
             .expect("the test tenant is onboarded by pushing a policy");
         let state = crate::test_support::state_with_tenant_policy(

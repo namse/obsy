@@ -15,6 +15,7 @@ pub const MAX_ADMIN_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Deserialize)]
 struct RetentionRequest {
+    revision: u64,
     retention: String,
     /// Bytes the tenant may keep stored, as a size such as `10GiB`. Optional
     /// so a control plane that only manages retention keeps working
@@ -27,10 +28,21 @@ struct RetentionRequest {
 #[derive(Serialize)]
 pub struct RetentionResponse {
     tenant: String,
+    revision: u64,
     retention: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_stored_bytes: Option<String>,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<PushOutcome>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PushOutcome {
+    Applied,
+    Duplicate,
+    Stale,
 }
 
 #[derive(Serialize)]
@@ -57,21 +69,29 @@ pub async fn put_retention(
             format!("invalid retention request body: {error}"),
         )
     })?;
-    let view = state
+    let result = state
         .tenant_policy
         .push(
             &tenant,
+            request.revision,
             &request.retention,
             request.max_stored_bytes.as_deref(),
         )
         .await
         .map_err(into_http)?;
+    let (view, outcome) = match result {
+        crate::tenant_policy::PushResult::Applied(view) => (view, PushOutcome::Applied),
+        crate::tenant_policy::PushResult::Duplicate(view) => (view, PushOutcome::Duplicate),
+        crate::tenant_policy::PushResult::Stale(view) => (view, PushOutcome::Stale),
+    };
     tracing::info!(%tenant, retention = %view.retention, "tenant policy updated");
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
+        revision: view.revision,
         retention: view.retention,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
+        result: Some(outcome),
     }))
 }
 
@@ -88,9 +108,11 @@ pub async fn get_retention(
     })?;
     Ok(Json(RetentionResponse {
         tenant: tenant.as_str().to_string(),
+        revision: view.revision,
         retention: view.retention,
         max_stored_bytes: view.max_stored_bytes,
         updated_at: rfc3339(view.updated_at),
+        result: None,
     }))
 }
 
@@ -111,9 +133,11 @@ pub async fn list_tenants(
                 .views()
                 .map(|(tenant, view)| RetentionResponse {
                     tenant: tenant.as_str().to_string(),
+                    revision: view.revision,
                     retention: view.retention,
                     max_stored_bytes: view.max_stored_bytes,
                     updated_at: rfc3339(view.updated_at),
+                    result: None,
                 })
                 .collect()
         })
@@ -208,6 +232,10 @@ fn into_http(error: PolicyError) -> (StatusCode, String) {
         // is what bounds the exposure of a delayed upgrade to a retry rather
         // than to an outage.
         PolicyError::Persist(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
+        PolicyError::RevisionConflict { revision } => (
+            StatusCode::CONFLICT,
+            format!("revision {revision} already has a different policy"),
+        ),
     }
 }
 

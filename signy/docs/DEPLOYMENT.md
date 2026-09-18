@@ -24,7 +24,10 @@ Each catalog commit is an append-only object with two fixed replicas under
 `catalog/commits/a/` and `catalog/commits/b/`; periodic snapshots use the same
 layout. Configure a Bucket Lock rule covering the deployment's `catalog/`
 prefix with a retention period that covers the service's recovery and audit
-requirements. Signy never garbage-collects catalog history in this format.
+requirements. Catalog history is kept unless `SIGNY_CATALOG_PRUNE_MIN_AGE` is
+set; then only commits and snapshots older than that age which no startup reads
+any more are deleted. Set it above the Bucket Lock retention, which refuses
+younger deletes: with a seven-day lock, `8d`.
 
 **Create an API token** scoped to that one bucket, with read and write. R2
 tokens come with an access key id and secret in the S3 shape, which is what
@@ -40,7 +43,9 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 ```
 
-`OBJECT_STORE_CONDITIONAL_PUT=etag` is not optional. A commit first creates a
+`OBJECT_STORE_CONDITIONAL_PUT=etag` is already the `object_store` default; the
+line states the requirement rather than changing it, and `disabled` is refused at
+startup. A commit first creates a
 generation object and then creates its identical replica; without conditional
 writes two writers can publish the same generation and diverge. Startup runs a
 preflight that writes a probe object and checks **that writes which should be
@@ -372,7 +377,8 @@ container that has never been removed keeps every line it has written. In order,
 it will tell you:
 
 - the configured memory budget — check it against the machine's RAM
-- `restored object-store manifest` with a generation and part count
+- `claimed the object-store writer epoch` with the new epoch
+- `restored object-store manifest` with a catalog generation and part count
 - a warning if a listener bound loopback, which is expected here
 - `signy listening`
 

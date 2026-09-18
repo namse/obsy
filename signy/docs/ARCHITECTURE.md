@@ -100,7 +100,7 @@ remain nonetheless.
   not measurements, and because injection occurs above the `object_store` client, its retry layer is not
   validated. **This is the largest remaining risk.**
 - **Throttling** — S3 limits request rates per prefix while MinIO does not. With the default configuration,
-  the manifest is about 0.2 PUT/s and the total is about 10 PUT/s, four orders of magnitude below the limit,
+  catalog commits are about 0.4 PUT/s (two replicas) and the total is about 10 PUT/s, four orders of magnitude below the limit,
   so the actual risk is small.
 - **Cost** — This design has been dominated by R2 Class A costs, but MinIO provides no cost signal.
   Amounts cannot be measured locally, but operation counts can.
@@ -108,10 +108,14 @@ remain nonetheless.
 
 **CAS preflight.** At startup, `ObjectStorage::verify_conditional_put` checks with a probe object that
 *a write that should be rejected is rejected*, and refuses startup otherwise. The positive path proves
-nothing — the first manifest write in an empty prefix succeeds whether conditions are honored or not.
+nothing — the first catalog write in an empty prefix succeeds whether conditions are honored or not.
 Because this check runs against the deployment target itself, it answers the locally unanswerable question
 of whether CAS works with that provider. `file://` is a development backend that intentionally gives up
 CAS, so it is skipped.
+
+Under an R2 Bucket Lock rule, a create on a catalog key that already exists is answered with
+`409 ObjectLockedByBucketPolicy` rather than `412`. `object_store` maps both to `AlreadyExists`, so a
+writer that lost the race to a generation rereads the catalog either way; this was checked against R2.
 
 The procedure and acceptance criteria are in [`LOAD_VALIDATION.md`](LOAD_VALIDATION.md).
 
@@ -209,7 +213,7 @@ app ──OTLP/HTTP──▶ collecty ──POST /signy/api/v1/collect──▶ 
          Part creation (immutable): Parquet + sidecars
             │
             ▼
-         S3 upload → manifest update → journal truncate
+         S3 upload → catalog commit → journal truncate
 ```
 
 - Crash recovery = journal replay. Part size is independent of ingest speed.
@@ -279,7 +283,7 @@ younger than the rest of this document:
 
 Flat-filter parsing (`query/params.rs`) → plan → pruning in this order:
 
-1. Time range → partition/part selection (manifest + part metadata)
+1. Time range → partition/part selection (catalog + part metadata)
 2. `attr` equalities and structured-field filters → row-group and window pruning with exact-field blooms
 3. Line filters (`contains`, `regex`) → row-group pruning with trigram blooms
 4. Scan only remaining row groups (MemTable + local parts; a part evicted from the local cache is
@@ -306,13 +310,13 @@ Flat-filter parsing (`query/params.rs`) → plan → pruning in this order:
 
 - Upload immutable part objects before publishing one global catalog commit. The commit is an append-only object with two fixed replicas and an embedded digest; periodic snapshots accelerate startup replay. Conditional object creation fences competing writers, and R2 Bucket Lock on `catalog/` prevents deletion or overwrite of history. The S3 bucket-versioning API is not required.
 - The local disk is a part cache. Keep small metadata/bloom catalog files and LRU-evict only `data.parquet` bodies. Queries and merges download only bodies selected by time and label pruning into a verified temporary directory and pin them against eviction while reading. Parquet range-read optimization is deferred.
-- Hardware replacement (graceful shutdown): 1) on SIGTERM, immediately block the ingest endpoint (reject new requests); 2) drain until accepted in-flight requests finish WAL append/ack; 3) force-flush the MemTable accumulated by then and verify S3 upload and manifest update completion; 4) terminate the process, discard the disk, and switch hardware. Data Alloy tried to send after blocking is retried from Alloy's own buffer because it receives no ack, then reaches the replacement when it resumes the same endpoint. A narrow disconnect just before ack during drain can cause duplicates (same nature as at-least-once above), but not loss.
+- Hardware replacement (graceful shutdown): 1) on SIGTERM, immediately block the ingest endpoint (reject new requests); 2) drain until accepted in-flight requests finish WAL append/ack; 3) force-flush the MemTable accumulated by then and verify S3 upload and catalog commit completion; 4) terminate the process, discard the disk, and switch hardware. Data Alloy tried to send after blocking is retried from Alloy's own buffer because it receives no ack, then reaches the replacement when it resumes the same endpoint. A narrow disconnect just before ack during drain can cause duplicates (same nature as at-least-once above), but not loss.
 
 ### Object-store settings
 
  - `SIGNY_OBJECT_STORE_URL`: Format `s3://bucket/prefix`. Development and tests may use single-process `file:///absolute/path`. `file://` catalog updates use in-process serialization and atomic rename and do not provide multi-writer conditional creation. Unset means local-only mode.
  - S3 credentials, region, endpoint, and path-style options use the AWS/OBJECT_STORE environment variables read by `object_store`.
- - `SIGNY_CACHE_MAX_BYTES`: Local Parquet-body cache limit (10 GiB by default; small catalog files excluded). Evict the least recently accessed bodies first and download them again from the manifest for later queries.
+ - `SIGNY_CACHE_MAX_BYTES`: Local Parquet-body cache limit (10 GiB by default; small catalog files excluded). Evict the least recently accessed bodies first and download them again from the catalog for later queries.
  - On startup, recover the append-only catalog first. Replay from the newest valid snapshot, require contiguous generations and matching parent digests, and refuse a legacy mutable manifest layout. A missing or invalid one of the two fixed replicas is recovered from the other; divergent valid replicas and gaps fail closed before workers start. Leave a durable marker before upload so work interrupted before catalog publication can be validated and resumed on the next startup. A part with only a complete remote object set and no marker is considered an inactive generation and is not resurrected. Local directories outside the registry are not deleted automatically and remain for later retention.
 
 ### Ingest input limits

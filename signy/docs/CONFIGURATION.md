@@ -268,7 +268,7 @@ and there is no global period.
 | `SIGNY_RETENTION_BATCH_SIZE` | 100 | Number of parts processed per tick |
 | `SIGNY_RETENTION_GRACE_PERIOD` | `1h` | Grace period before deleting orphan objects |
 | `SIGNY_MAX_RETENTION_RUNTIME` | `2m` | Object-store operation timeout for retention and catalog pruning |
-| `SIGNY_ORPHAN_GC_INTERVAL` | `1h` | How often part objects that no manifest names are collected, whether or not retention retired anything. Merges and compactions leave their inputs behind as orphans too |
+| `SIGNY_ORPHAN_GC_INTERVAL` | `1h` | How often part objects that no catalog generation names are collected, whether or not retention retired anything. Merges and compactions leave their inputs behind as orphans too |
 | `SIGNY_ORPHAN_GC_MAX_RUNTIME` | `2m` | What one collection pass may spend. The pass saves its scan cursor and its sightings, and the next one carries on from there, so this bounds a pass rather than the collection |
 | `SIGNY_ORPHAN_GC_MAX_SCANNED_OBJECTS` | 200000 | Objects one pass lists before it stops and saves its place |
 | `SIGNY_ORPHAN_GC_MAX_DELETED_OBJECTS` | 20000 | Objects one pass deletes. `signy_orphan_candidate_objects` reports what is still waiting |
@@ -418,12 +418,13 @@ rather than through a subscriber, which is the same place it went before.
 
 ## The flush interval is the object-store bill
 
-A flush costs **four PUTs and one GET**: three PUTs for the part's immutable
-files (`data.parquet`, `index.bin`, `meta.json`), one for the manifest, and the
-GET is the manifest it replaced. **Pinned by a test rather than by a load run**
+A flush costs **five PUTs**: three for the part's immutable files
+(`data.parquet`, `index.bin`, `meta.json`) and two for the catalog generation's
+`a` and `b` replicas. Once the catalog is loaded a flush reads nothing back.
+**Pinned by a test rather than by a load run**
 — `object_storage::tests::publishing_a_part_costs_a_fixed_number_of_requests` —
 which also holds the two properties that matter: publishing the tenth part into
-a nine-part manifest costs what publishing the first into an empty one cost, and
+a nine-part catalog costs what publishing the first into an empty one cost, and
 the file count per part is asserted rather than incidental. The load run that
 first counted these requests is retired ([`LOAD_RESULTS.md`](LOAD_RESULTS.md) §9)
 and the count outlived it, because a request count is a property of this code
@@ -436,15 +437,15 @@ nothing else:
 
 | `FLUSH_MAX_INTERVAL` | Class A / day | / month | R2 cost |
 |---|---|---|---|
-| 2 s | 172,800 | 5.18 M | $18.83 |
-| 5 s (**default**) | 69,120 | 2.07 M | $4.83 |
-| 15 s | 23,040 | 0.69 M | free tier |
-| 30 s | 11,520 | 0.35 M | free tier |
-| 60 s | 5,760 | 0.17 M | free tier |
+| 2 s | 216,000 | 6.48 M | $24.66 |
+| 5 s (**default**) | 86,400 | 2.59 M | $7.16 |
+| 15 s | 28,800 | 0.86 M | free tier |
+| 30 s | 14,400 | 0.43 M | free tier |
+| 60 s | 7,200 | 0.22 M | free tier |
 
 **The default does not fit the budget this engine was designed around.** The
 shared-part layout exists because per-tenant objects broke a $1/month plan, and
-one busy instance at the default spends almost five times that before any
+one busy instance at the default spends about seven times that before any
 tenant multiplier. Consolidating the two index sidecars into one file took a
 fifth off this table; the remaining term is the flush rate itself.
 

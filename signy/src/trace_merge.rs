@@ -54,7 +54,11 @@ const SPAN_DECODE_EXPANSION: u64 = 8;
 
 fn crash_if_requested(point: &str) {
     #[cfg(test)]
-    if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT").ok().as_deref() == Some(point) {
+    if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
         std::process::abort();
     }
     #[cfg(not(test))]
@@ -823,11 +827,9 @@ mod tests {
             for part_index in 0..COMPACT_MIN_PARTS {
                 flush_one_part(&root, part_index);
             }
-            let registry = TraceRegistry::load_from_disk(
-                &root,
-                Arc::new(tokio::sync::RwLock::new(())),
-            )
-            .unwrap();
+            let registry =
+                TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(())))
+                    .unwrap();
             let before = all_spans(&registry);
             if point == "recovery_record_processing" {
                 let inputs = select_inputs(&registry.snapshot(), FIXTURE_NOW_NS).unwrap();
@@ -852,21 +854,27 @@ mod tests {
                 .env("SIGNY_TEST_COMPACTION_ROOT", &root)
                 .status()
                 .unwrap();
-            assert!(!status.success(), "fault point {point} did not terminate the child");
+            assert!(
+                !status.success(),
+                "fault point {point} did not terminate the child"
+            );
 
             for _ in 0..3 {
                 recover_local_compactions(&root).unwrap();
-                let restarted = TraceRegistry::load_from_disk(
-                    &root,
-                    Arc::new(tokio::sync::RwLock::new(())),
-                )
-                .unwrap();
+                let restarted =
+                    TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(())))
+                        .unwrap();
                 assert_eq!(all_spans(&restarted), before, "fault point {point}");
             }
             assert!(read_records(&root).unwrap().is_empty());
-            assert!(std::fs::read_dir(compact_dir(&root))
-                .unwrap()
-                .all(|entry| entry.unwrap().path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
+            assert!(std::fs::read_dir(compact_dir(&root)).unwrap().all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    != Some("tmp")
+            }));
             std::fs::remove_dir_all(&root).ok();
         }
     }
@@ -882,11 +890,9 @@ mod tests {
         {
             recover_local_compactions(&root).unwrap();
         } else {
-            let registry = TraceRegistry::load_from_disk(
-                &root,
-                Arc::new(tokio::sync::RwLock::new(())),
-            )
-            .unwrap();
+            let registry =
+                TraceRegistry::load_from_disk(&root, Arc::new(tokio::sync::RwLock::new(())))
+                    .unwrap();
             let config = Config {
                 row_group_size: 16,
                 ..Config::default()

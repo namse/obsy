@@ -48,7 +48,11 @@ const COMPACT_DIR: &str = ".compact";
 
 fn crash_if_requested(point: &str) {
     #[cfg(test)]
-    if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT").ok().as_deref() == Some(point) {
+    if std::env::var("SIGNY_TEST_COMPACTION_CRASH_POINT")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
         std::process::abort();
     }
     #[cfg(not(test))]
@@ -798,7 +802,10 @@ mod tests {
                 .env("SIGNY_TEST_COMPACTION_ROOT", &root)
                 .status()
                 .unwrap();
-            assert!(!status.success(), "fault point {point} did not terminate the child");
+            assert!(
+                !status.success(),
+                "fault point {point} did not terminate the child"
+            );
 
             for _ in 0..3 {
                 recover_local_compactions(&root).unwrap();
@@ -806,9 +813,14 @@ mod tests {
                 assert_eq!(all_samples(&restarted), before, "fault point {point}");
             }
             assert!(read_records(&root).unwrap().is_empty());
-            assert!(std::fs::read_dir(compact_dir(&root))
-                .unwrap()
-                .all(|entry| entry.unwrap().path().extension().and_then(|ext| ext.to_str()) != Some("tmp")));
+            assert!(std::fs::read_dir(compact_dir(&root)).unwrap().all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    != Some("tmp")
+            }));
             std::fs::remove_dir_all(&root).ok();
         }
     }

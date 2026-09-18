@@ -265,7 +265,8 @@ removes the duplicates yet — that is deduplication, still open in `todo.md`.
 S3 is the source of truth. The local disk is the cache plus the unflushed WAL.
 
 - Configure R2 Bucket Lock for the `catalog/` prefix and keep the two catalog replicas in the same bucket.
-  The engine does not delete catalog history in this format.
+  Catalog history is deleted only when `SIGNY_CATALOG_PRUNE_MIN_AGE` is set, and only past that age.
 - Catalog generations are append-only and each is stored twice with a digest. Loss of both replicas or the
-  entire bucket is outside the recovery guarantee; a single missing or invalid replica is repaired from the other.
+  entire bucket is outside the recovery guarantee. A missing replica is recreated from the other; an invalid
+  one is read past with a warning and stays in place, since the lock forbids rewriting it.
 - Backing up the local disk is not meaningful — it contains either cache data or data that is not yet durable.
